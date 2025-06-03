@@ -282,28 +282,34 @@ class MyRecommender:
         # Convert relevance to binary (0 or 1)
         y = (joined_pd["relevance"] > 0).astype(int)
         
-        # Train model with L1 regularization
+        # Train model with improved regularization
         from sklearn.linear_model import LogisticRegression
         from sklearn.model_selection import GridSearchCV
         
         param_grid = {
-            'C': [0.01, 0.1, 1.0, 10.0],  # Inverse of regularization strength
-            'penalty': ['l1'],
-            'solver': ['liblinear'],  # liblinear is efficient for L1 regularization
+            'C': [0.1, 1.0, 10.0],  # Reduced parameter space
+            'penalty': ['l1'],  # Using L1 for sparsity
+            'solver': ['liblinear'],  # More stable solver
             'max_iter': [1000],
-            'class_weight': ['balanced', None]
+            'class_weight': ['balanced']
         }
         
-        
-        base_model = LogisticRegression(random_state=self.seed)
-        grid_search = GridSearchCV(
-            base_model, param_grid, cv=3, scoring='f1', n_jobs=-1
+        base_model = LogisticRegression(
+            random_state=self.seed,
+            max_iter=1000,
+            tol=1e-3  # Relaxed tolerance
         )
         
-        grid_search.fit(X_transformed, y)
+        grid_search = GridSearchCV(
+            base_model, 
+            param_grid, 
+            cv=3, 
+            scoring='f1', 
+            verbose=1
+        )
         
-        # Save best model and feature importance
-        self.model = grid_search.best_estimator_
+        # Save preprocessor
+        self.preprocessor_ = preprocessor
         
         # Get feature names after one-hot encoding
         feature_names = (
@@ -311,16 +317,41 @@ class MyRecommender:
             numeric_cols
         )
         
-        # Calculate feature importance (absolute coefficient values)
+        # Scale the features to help with convergence
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        X_transformed_scaled = scaler.fit_transform(X_transformed)
+        
+        # Add feature selection to reduce dimensionality
+        from sklearn.feature_selection import SelectFromModel
+        selector = SelectFromModel(
+            LogisticRegression(penalty='l1', solver='liblinear', C=0.1),
+            prefit=False,
+            threshold='median'
+        )
+        
+        # Fit selector and transform features
+        X_transformed_selected = selector.fit_transform(X_transformed_scaled, y)
+        
+        # Fit the model
+        grid_search.fit(X_transformed_selected, y)
+        
+        # Save models and transformers
+        self.model = grid_search.best_estimator_
+        self.scaler_ = scaler
+        self.selector_ = selector
+        
+        # Get feature names after selection
+        selected_features = np.array(feature_names)[selector.get_support()]
+        
+        # Calculate feature importance
         self.feature_importance_ = dict(zip(
-            feature_names,
+            selected_features,
             np.abs(self.model.coef_[0])
         ))
         
-        # Save preprocessor
-        self.preprocessor_ = preprocessor
-        
         print(f"Best parameters: {grid_search.best_params_}")
+        print(f"\nNumber of features selected: {len(selected_features)}")
         print("\nTop 10 most important features:")
         for feature, importance in sorted(
             self.feature_importance_.items(),
@@ -379,7 +410,9 @@ class MyRecommender:
         
         # Transform and predict
         X_rec = self.preprocessor_.transform(feature_df)
-        preds = self.model.predict_proba(X_rec)[:, 1]  # Get probability of positive class
+        X_rec_scaled = self.scaler_.transform(X_rec)
+        X_rec_selected = self.selector_.transform(X_rec_scaled)
+        preds = self.model.predict_proba(X_rec_selected)[:, 1]
         
         # Create final recommendations
         scored = ids.copy()
