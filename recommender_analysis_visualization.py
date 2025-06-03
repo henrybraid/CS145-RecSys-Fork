@@ -96,11 +96,11 @@ class MyRecommender:
         if 'u_income' in feature_df.columns and 'i_price' in feature_df.columns:
             feature_df['price_sensitivity'] = feature_df['i_price'] / (feature_df['u_income'] + 1)
             feature_df['price_affordability'] = feature_df['u_income'] / (feature_df['i_price'] + 1)
-            try:
-                feature_df['price_range_match'] = pd.qcut(feature_df['i_price'], q=5, labels=['very_low', 'low', 'medium', 'high', 'very_high'])
-            except ValueError:
-                # If all prices are the same, assign a default category
-                feature_df['price_range_match'] = 'medium'
+            feature_df['price_range_match'] = pd.qcut(feature_df['i_price'], q=5, labels=['very_low', 'low', 'medium', 'high', 'very_high'])
+            
+            # Add price elasticity features
+            feature_df['price_elasticity'] = feature_df['price_sensitivity'] * feature_df['price_affordability']
+            feature_df['price_category_match'] = feature_df['price_range_match'].astype(str) + '_' + feature_df['i_category'].astype(str)
         
         # Category preference features
         if 'u_segment' in feature_df.columns and 'i_category' in feature_df.columns:
@@ -177,6 +177,7 @@ class MyRecommender:
         for col in numeric_cols:
             if col in feature_df.columns:
                 feature_df[f'{col}_squared'] = feature_df[col] ** 2
+                feature_df[f'{col}_cubed'] = feature_df[col] ** 3
         
         return feature_df
 
@@ -288,24 +289,32 @@ class MyRecommender:
         
         param_grid = {
             'C': [0.1, 1.0, 10.0],  # Reduced parameter space
-            'penalty': ['l1'],  # Using L1 for sparsity
-            'solver': ['liblinear'],  # More stable solver
-            'max_iter': [1000],
+            'penalty': ['elasticnet'],
+            'l1_ratio': [0.3, 0.5, 0.7],  # Reduced L1/L2 mixing options
+            'solver': ['saga'],  # SAGA is required for elasticnet
+            'max_iter': [2000],  # Increased for better convergence
+            'tol': [1e-3],  # Relaxed tolerance
             'class_weight': ['balanced']
         }
         
         base_model = LogisticRegression(
             random_state=self.seed,
-            max_iter=1000,
-            tol=1e-3  # Relaxed tolerance
+            max_iter=2000,
+            tol=1e-3,
+            warm_start=True  # Enable warm start for better convergence
         )
+        
+        # Use simpler cross-validation
+        from sklearn.model_selection import KFold
+        cv = KFold(n_splits=3, shuffle=True, random_state=self.seed)
         
         grid_search = GridSearchCV(
             base_model, 
             param_grid, 
-            cv=3, 
-            scoring='f1', 
-            verbose=1
+            cv=cv,
+            scoring='f1',
+            verbose=1,
+            n_jobs=1  # Disable parallel processing to avoid memory issues
         )
         
         # Save preprocessor
