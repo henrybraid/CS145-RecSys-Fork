@@ -1,0 +1,237 @@
+# Cell: Define custom recommender template
+import numpy as np
+import pandas as pd
+from typing import Optional, List, Dict, Any
+
+from pyspark.sql import DataFrame, Window
+from pyspark.sql import functions as sf
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.linalg import Vectors, VectorUDT
+from pyspark.sql.types import DoubleType, ArrayType
+
+import sklearn 
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sim4rec.utils import pandas_to_spark
+
+import xgboost as xgb
+from xgboost import XGBClassifier
+
+"""
+## MyRecommender Template
+Below is a template class for implementing a custom recommender system.
+Students should extend this class with their own recommendation algorithm.
+"""
+
+class MyRecommender:
+    """
+    Template class for implementing a custom recommender.
+    
+    This class provides the basic structure required to implement a recommender
+    that can be used with the Sim4Rec simulator. Students should extend this class
+    with their own recommendation algorithm.
+    """
+    
+    def __init__(self, seed=None):
+        """
+        Initialize recommender.
+        
+        Args:
+            seed: Random seed for reproducibility
+        """
+        # Add your initialization logic here
+        self.seed = seed
+        self.categorical_cols = None
+        self.numerical_cols = None
+        self.input_cols = None
+        self.pipeline = None
+        self.model = None
+        self.best_params = None
+        self.encoder = OneHotEncoder(handle_unknown='ignore',sparse_output = False)
+        self.scalar = StandardScaler()
+
+    def _create_features(self, features):
+        #average category price
+        if 'i_category' in features.columns and 'i_price' in features.columns:
+            features['avg_category_price'] = features.groupby('i_category')['i_price'].transform('mean')
+        
+        #get the average price spent by user
+        if 'user_idx' in features.columns and 'i_price' in features.columns:
+            features['user_avg_price'] = features.groupby('user_idx')['i_price'].transform('mean')
+
+        #get the price of the item compared to the average amount spent by the users
+        if 'user_avg_price' in features.columns and 'i_price' in features.columns:
+            features['price_vs_user_mean'] = features['i_price'] - features['user_avg_price']
+        
+        return features
+
+    
+    def _setup_df(self, log, user_features = None, item_features = None):
+        
+        #add 'u_' prefix to the user features, helps with clarity
+        user_features = user_features.select(
+            [sf.col('user_idx')] + 
+            [sf.col(c).alias(f'u_{c}') for c in user_features.columns if c != 'user_idx']
+        )
+
+        #add 'i_' prefix to the item features, helps with clarity
+        item_features = item_features.select(
+            [sf.col('item_idx')] + 
+            [sf.col(c).alias(f'i_{c}') for c in item_features.columns if c != 'item_idx']
+        )
+
+        pd_log = (
+            log.alias('l')
+                .join(user_features.alias('u'), on='user_idx', how = 'inner')
+                .join(item_features.alias('i'), on='item_idx', how = 'inner')
+                .toPandas()
+        )
+
+        return pd_log, user_features, item_features
+    
+    def _preprocess_features(self, features):
+        self.categorical_cols = features.select_dtypes(include=['object', 'category']).columns.tolist()
+        self.numerical_cols = features.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
+        self.input_cols = self.categorical_cols + self.numerical_cols
+        
+
+        cat_pipeline = Pipeline([
+            ('impute', SimpleImputer(strategy='most_frequent')),
+            ('onehot', self.encoder)
+        ])
+
+        num_pipeline = Pipeline([
+            ('impute', SimpleImputer(strategy='mean')),
+            ('scale', self.scalar)
+        ])
+
+        self.pipeline = ColumnTransformer(
+            transformers = [
+                ('cat', cat_pipeline, self.categorical_cols),
+                ('num', num_pipeline, self.numerical_cols)
+            ]
+        )
+
+        features = features.reindex(columns=self.input_cols)
+        features_transformed = self.pipeline.fit_transform(features)
+
+        return features_transformed
+
+    def _get_best_model(self, X, y):
+        param_grid = {
+            "n_estimators": [25, 50, 100, 200],
+            "learning_rate": [0.01, 0.05],
+            "max_depth": [4, 8, 16],
+            "min_child_weight": [1, 5, 10],
+        }
+        base_model = XGBClassifier(
+                    objective="binary:logistic", 
+                    random_state = self.seed, 
+                    tree_method = 'hist',
+                    n_jobs = 4)
+        grid_search = GridSearchCV(
+            base_model, param_grid, 
+            cv = 3, 
+            scoring = 'neg_mean_squared_error',
+            n_jobs = 1)
+        grid_search.fit(X, y)
+
+        self.best_params = grid_search.best_params_
+
+        return grid_search.best_estimator_
+
+    def fit(self, log, user_features=None, item_features=None):
+        """
+        Train the recommender model based on interaction history.
+        
+        Args:
+            log: Interaction log with user_idx, item_idx, and relevance columns
+            user_features: User features dataframe (optional)
+            item_features: Item features dataframe (optional)
+        """
+        # Implement your training logic here
+        # For example:
+        #  1. Extract relevant features from user_features and item_features
+        #  2. Learn user preferences from the log
+        #  3. Build item similarity matrices or latent factor models
+        #  4. Store learned parameters for later prediction
+        if user_features and item_features:
+            pd_log, user_features, item_features = self._setup_df(log, user_features, item_features)
+            
+            pd_log = self._create_features(pd_log)
+            features = pd_log.drop(columns=['user_idx', 'item_idx', 'relevance'])
+
+            X = self._preprocess_features(features)
+            y = pd_log['relevance'].values
+
+            #self.model = self._get_best_model(X,y)
+            if self.model is None:
+                self.model = self._get_best_model(X,y)
+                print(f'\nBest parameters: {self.best_params}\n')
+
+            else:
+                self.model = XGBClassifier(
+                            **self.best_params,
+                            random_state=self.seed,
+                            tree_method="hist")  
+                self.model.fit(X,y) 
+
+    
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        """
+        Generate recommendations for users.
+        
+        Args:
+            log: Interaction log with user_idx, item_idx, and relevance columns
+            k: Number of items to recommend
+            users: User dataframe
+            items: Item dataframe
+            user_features: User features dataframe (optional)
+            item_features: Item features dataframe (optional)
+            filter_seen_items: Whether to filter already seen items
+            
+        Returns:
+            DataFrame: Recommendations with user_idx, item_idx, and relevance columns
+        """
+        # Implement your recommendation logic here
+        # For example:
+        #  1. Extract relevant features for prediction
+        #  2. Calculate relevance scores for each user-item pair
+        #  3. Rank items by relevance and select top-k
+        #  4. Return a dataframe with columns: user_idx, item_idx, relevance
+        candidate_df = users.crossJoin(items)
+
+        if filter_seen_items and log is not None:
+            seen = log.select("user_idx", "item_idx").distinct()
+            candidate_df = candidate_df.join(seen, ["user_idx", "item_idx"], "left_anti")
+
+        candidate_pd, _, _ = self._setup_df(candidate_df, user_features, item_features)
+
+        candidate_pd = self._create_features(candidate_pd)
+
+        meta_pd = candidate_pd[["user_idx", "item_idx"]].copy()
+
+        features = candidate_pd.drop(
+                        columns=[c for c in ["__iter", "relevance"] if c in candidate_pd.columns],
+                        errors="ignore"
+                )
+    
+        features = features.reindex(columns=self.input_cols, fill_value=np.nan)
+
+        X = self.pipeline.transform(features)
+
+        meta_pd["relevance"] = self.model.predict_proba(X)[:, 1]
+
+        #Rank and take top k
+        topk_pd = (
+            meta_pd.sort_values(["user_idx", "relevance"], ascending=[True, False])
+                .groupby("user_idx")
+                .head(k)
+            )
+    
+        return pandas_to_spark(topk_pd[["user_idx", "item_idx", "relevance"]])
+    

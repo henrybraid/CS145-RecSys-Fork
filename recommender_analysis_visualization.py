@@ -46,101 +46,8 @@ from sample_recommenders import (
     ContentBasedRecommender, 
     SVMRecommender, 
 )
+from myrecommender import MyRecommender
 from config import DEFAULT_CONFIG, EVALUATION_METRICS
-
-# Cell: Define custom recommender template
-"""
-## MyRecommender Template
-Below is a template class for implementing a custom recommender system.
-Students should extend this class with their own recommendation algorithm.
-"""
-
-class MyRecommender:
-    """
-    Template class for implementing a custom recommender.
-    
-    This class provides the basic structure required to implement a recommender
-    that can be used with the Sim4Rec simulator. Students should extend this class
-    with their own recommendation algorithm.
-    """
-    
-    def __init__(self, seed=None):
-        """
-        Initialize recommender.
-        
-        Args:
-            seed: Random seed for reproducibility
-        """
-        self.seed = seed
-        # Add your initialization logic here
-    
-    def fit(self, log, user_features=None, item_features=None):
-        """
-        Train the recommender model based on interaction history.
-        
-        Args:
-            log: Interaction log with user_idx, item_idx, and relevance columns
-            user_features: User features dataframe (optional)
-            item_features: Item features dataframe (optional)
-        """
-        # Implement your training logic here
-        # For example:
-        #  1. Extract relevant features from user_features and item_features
-        #  2. Learn user preferences from the log
-        #  3. Build item similarity matrices or latent factor models
-        #  4. Store learned parameters for later prediction
-        pass
-    
-    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
-        """
-        Generate recommendations for users.
-        
-        Args:
-            log: Interaction log with user_idx, item_idx, and relevance columns
-            k: Number of items to recommend
-            users: User dataframe
-            items: Item dataframe
-            user_features: User features dataframe (optional)
-            item_features: Item features dataframe (optional)
-            filter_seen_items: Whether to filter already seen items
-            
-        Returns:
-            DataFrame: Recommendations with user_idx, item_idx, and relevance columns
-        """
-        # Implement your recommendation logic here
-        # For example:
-        #  1. Extract relevant features for prediction
-        #  2. Calculate relevance scores for each user-item pair
-        #  3. Rank items by relevance and select top-k
-        #  4. Return a dataframe with columns: user_idx, item_idx, relevance
-        
-        # Example of a random recommender implementation:
-        # Cross join users and items
-        recs = users.crossJoin(items)
-        
-        # Filter out already seen items if needed
-        if filter_seen_items and log is not None:
-            seen_items = log.select("user_idx", "item_idx")
-            recs = recs.join(
-                seen_items,
-                on=["user_idx", "item_idx"],
-                how="left_anti"
-            )
-        
-        # Add random relevance scores
-        recs = recs.withColumn(
-            "relevance",
-            sf.rand(seed=self.seed)
-        )
-        
-        # Rank items by relevance for each user
-        window = Window.partitionBy("user_idx").orderBy(sf.desc("relevance"))
-        recs = recs.withColumn("rank", sf.row_number().over(window))
-        
-        # Filter top-k recommendations
-        recs = recs.filter(sf.col("rank") <= k).drop("rank")
-        
-        return recs
 
 # Cell: Data Exploration Functions
 """
@@ -718,7 +625,7 @@ def visualize_detailed_metrics(results_df, recommender_names):
     key_metrics = [m for m in key_metrics if m in all_metrics]
     
     # Plot metric trajectories for each key metric
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#A020F0']
     markers = ['o', 's', 'D', '^']
     
     for i, metric in enumerate(key_metrics):
