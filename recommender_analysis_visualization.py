@@ -216,7 +216,7 @@ class MyRecommender:
             )
         
         return user_stats, item_stats
-
+    
     def fit(self, log, user_features=None, item_features=None):
         """Train the recommender model with enhanced features."""
         # Create aggregate features
@@ -293,6 +293,7 @@ class MyRecommender:
             'max_iter': [1000],
             'class_weight': ['balanced', None]
         }
+        
         
         base_model = LogisticRegression(random_state=self.seed)
         grid_search = GridSearchCV(
