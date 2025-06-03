@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import defaultdict
 import shutil
+import random
 
 # Cell: Import libraries and set up environment
 """
@@ -20,6 +21,9 @@ from pyspark.sql import DataFrame, Window
 from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.linalg import Vectors, VectorUDT
 from pyspark.sql.types import DoubleType, ArrayType
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
 
 # Set up plotting
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -72,75 +76,234 @@ class MyRecommender:
             seed: Random seed for reproducibility
         """
         self.seed = seed
-        # Add your initialization logic here
-    
-    def fit(self, log, user_features=None, item_features=None):
-        """
-        Train the recommender model based on interaction history.
+        self.model = None
+        self.categorical_cols_ = None
+        self.numeric_cols_ = None
+        self.input_columns_ = None
+        self.preprocessor_ = None
+        self.feature_importance_ = None
         
-        Args:
-            log: Interaction log with user_idx, item_idx, and relevance columns
-            user_features: User features dataframe (optional)
-            item_features: Item features dataframe (optional)
-        """
-        # Implement your training logic here
-        # For example:
-        #  1. Extract relevant features from user_features and item_features
-        #  2. Learn user preferences from the log
-        #  3. Build item similarity matrices or latent factor models
-        #  4. Store learned parameters for later prediction
-        pass
-    
-    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
-        """
-        Generate recommendations for users.
+        # Set random seed for reproducibility
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+
+    def _create_interaction_features(self, feature_df):
+        """Create interaction features between user and item attributes."""
+        # Create price sensitivity feature
+        if 'u_income' in feature_df.columns and 'i_price' in feature_df.columns:
+            feature_df['price_sensitivity'] = feature_df['i_price'] / (feature_df['u_income'] + 1)
         
-        Args:
-            log: Interaction log with user_idx, item_idx, and relevance columns
-            k: Number of items to recommend
-            users: User dataframe
-            items: Item dataframe
-            user_features: User features dataframe (optional)
-            item_features: Item features dataframe (optional)
-            filter_seen_items: Whether to filter already seen items
-            
-        Returns:
-            DataFrame: Recommendations with user_idx, item_idx, and relevance columns
-        """
-        # Implement your recommendation logic here
-        # For example:
-        #  1. Extract relevant features for prediction
-        #  2. Calculate relevance scores for each user-item pair
-        #  3. Rank items by relevance and select top-k
-        #  4. Return a dataframe with columns: user_idx, item_idx, relevance
+        # Create category preference features
+        if 'u_segment' in feature_df.columns and 'i_category' in feature_df.columns:
+            feature_df['segment_category_match'] = (feature_df['u_segment'] == feature_df['i_category']).astype(int)
         
-        # Example of a random recommender implementation:
-        # Cross join users and items
-        recs = users.crossJoin(items)
+        # Create price range features
+        if 'i_price' in feature_df.columns:
+            feature_df['price_range'] = pd.qcut(feature_df['i_price'], q=5, labels=['very_low', 'low', 'medium', 'high', 'very_high'])
         
-        # Filter out already seen items if needed
-        if filter_seen_items and log is not None:
-            seen_items = log.select("user_idx", "item_idx")
-            recs = recs.join(
-                seen_items,
-                on=["user_idx", "item_idx"],
-                how="left_anti"
-            )
+        return feature_df
+
+    def _create_aggregate_features(self, log_df, user_features, item_features):
+        """Create aggregate features from historical interactions."""
+        # User interaction counts
+        user_counts = log_df.groupBy("user_idx").count().withColumnRenamed("count", "user_interaction_count")
         
-        # Add random relevance scores
-        recs = recs.withColumn(
-            "relevance",
-            sf.rand(seed=self.seed)
+        # Item popularity
+        item_counts = log_df.groupBy("item_idx").count().withColumnRenamed("count", "item_popularity")
+        
+        # Average relevance by user
+        user_avg_relevance = log_df.groupBy("user_idx").agg(
+            sf.avg("relevance").alias("user_avg_relevance")
         )
         
-        # Rank items by relevance for each user
+        # Average relevance by item
+        item_avg_relevance = log_df.groupBy("item_idx").agg(
+            sf.avg("relevance").alias("item_avg_relevance")
+        )
+        
+        return user_counts, item_counts, user_avg_relevance, item_avg_relevance
+
+    def fit(self, log, user_features=None, item_features=None):
+        """Train the recommender model with enhanced features."""
+        # Create aggregate features
+        user_counts, item_counts, user_avg_relevance, item_avg_relevance = self._create_aggregate_features(
+            log, user_features, item_features
+        )
+        
+        # Join features with user and item data
+        user_features = user_features.join(user_counts, on="user_idx", how="left")
+        user_features = user_features.join(user_avg_relevance, on="user_idx", how="left")
+        
+        item_features = item_features.join(item_counts, on="item_idx", how="left")
+        item_features = item_features.join(item_avg_relevance, on="item_idx", how="left")
+        
+        # Add prefixes to features
+        user_features = user_features.select(
+            [sf.col("user_idx")] +
+            [sf.col(c).alias(f"u_{c}") for c in user_features.columns if c != "user_idx"]
+        )
+        item_features = item_features.select(
+            [sf.col("item_idx")] +
+            [sf.col(c).alias(f"i_{c}") for c in item_features.columns if c != "item_idx"]
+        )
+        
+        # Join all data
+        joined = (
+            log.alias("l")
+               .join(user_features.alias("u"), on="user_idx", how="inner")
+               .join(item_features.alias("i"), on="item_idx", how="inner")
+        )
+        
+        # Convert to pandas
+        joined_pd = joined.toPandas()
+        
+        # Create interaction features
+        feature_df = joined_pd.drop(columns=["user_idx", "item_idx", "relevance"])
+        feature_df = self._create_interaction_features(feature_df)
+        
+        # Split columns by dtype
+        categorical_cols = feature_df.select_dtypes(include=["object", "category"]).columns.tolist()
+        numeric_cols = feature_df.select_dtypes(include=["int64", "float64", "int32", "float32"]).columns.tolist()
+        
+        # Save column information
+        self.categorical_cols_ = categorical_cols
+        self.numeric_cols_ = numeric_cols
+        self.input_columns_ = categorical_cols + numeric_cols
+        
+        # Handle missing values and ensure proper types
+        for col in categorical_cols:
+            feature_df[col] = feature_df[col].fillna('missing').astype(str)
+        for col in numeric_cols:
+            feature_df[col] = pd.to_numeric(feature_df[col], errors='coerce').fillna(0)
+        
+        # Create preprocessing pipeline
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), categorical_cols),
+                ("num", "passthrough", numeric_cols),
+            ]
+        )
+        
+        # Transform features
+        feature_df = feature_df.reindex(columns=self.input_columns_)
+        X_transformed = preprocessor.fit_transform(feature_df)
+        
+        # Train model with cross-validation
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.model_selection import GridSearchCV
+        
+        param_grid = {
+            'n_estimators': [100, 200],
+            'max_depth': [10, 20, None],
+            'min_samples_split': [2, 5],
+            'min_samples_leaf': [1, 2]
+        }
+        
+        base_model = RandomForestRegressor(random_state=self.seed)
+        grid_search = GridSearchCV(
+            base_model, param_grid, cv=3, scoring='neg_mean_squared_error', n_jobs=-1
+        )
+        
+        y = joined_pd["relevance"].values
+        grid_search.fit(X_transformed, y)
+        
+        # Save best model and feature importance
+        self.model = grid_search.best_estimator_
+        self.feature_importance_ = dict(zip(
+            self.input_columns_,
+            self.model.feature_importances_
+        ))
+        
+        # Save preprocessor
+        self.preprocessor_ = preprocessor
+        
+        print(f"Best parameters: {grid_search.best_params_}")
+        print("\nTop 10 most important features:")
+        for feature, importance in sorted(
+            self.feature_importance_.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:10]:
+            print(f"{feature}: {importance:.4f}")
+
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        """Generate recommendations with enhanced features."""
+        # Create aggregate features
+        user_counts, item_counts, user_avg_relevance, item_avg_relevance = self._create_aggregate_features(
+            log, user_features, item_features
+        )
+        
+        # Join features
+        user_features = user_features.join(user_counts, on="user_idx", how="left")
+        user_features = user_features.join(user_avg_relevance, on="user_idx", how="left")
+        
+        item_features = item_features.join(item_counts, on="item_idx", how="left")
+        item_features = item_features.join(item_avg_relevance, on="item_idx", how="left")
+        
+        # Add prefixes
+        user_features = user_features.select(
+            [sf.col("user_idx")] +
+            [sf.col(c).alias(f"u_{c}") for c in user_features.columns if c != "user_idx"]
+        )
+        item_features = item_features.select(
+            [sf.col("item_idx")] +
+            [sf.col(c).alias(f"i_{c}") for c in item_features.columns if c != "item_idx"]
+        )
+        
+        # Create recommendations
+        recs = users.crossJoin(items)
+        
+        if filter_seen_items and log is not None:
+            seen = log.select("user_idx", "item_idx")
+            recs = recs.join(seen, on=["user_idx", "item_idx"], how="left_anti")
+        
+        recs = (
+            recs.alias("r")
+                .join(user_features.alias("u"), on="user_idx", how="inner")
+                .join(item_features.alias("i"), on="item_idx", how="inner")
+        )
+        
+        # Convert to pandas
+        recs_pd = recs.toPandas()
+        ids = recs_pd[["user_idx", "item_idx"]].copy()
+        
+        # Create interaction features
+        feature_df = recs_pd.reindex(columns=self.input_columns_)
+        feature_df = self._create_interaction_features(feature_df)
+        
+        # Handle missing values and types
+        for col in self.categorical_cols_:
+            feature_df[col] = feature_df[col].fillna('missing').astype(str)
+        for col in self.numeric_cols_:
+            feature_df[col] = pd.to_numeric(feature_df[col], errors='coerce').fillna(0)
+        
+        # Transform and predict
+        X_rec = self.preprocessor_.transform(feature_df)
+        preds = self.model.predict(X_rec)
+        
+        # Create final recommendations
+        scored = ids.copy()
+        scored["relevance"] = preds
+        
+        scored_spark = (
+            spark.createDataFrame(scored)
+                 .withColumn("relevance", sf.col("relevance"))
+        )
+        
         window = Window.partitionBy("user_idx").orderBy(sf.desc("relevance"))
-        recs = recs.withColumn("rank", sf.row_number().over(window))
+        ranked = (
+            scored_spark
+            .withColumn("rank", sf.row_number().over(window))
+            .filter(sf.col("rank") <= k)
+            .drop("rank")
+        )
         
-        # Filter top-k recommendations
-        recs = recs.filter(sf.col("rank") <= k).drop("rank")
+        return ranked
         
-        return recs
+        
+
+
 
 # Cell: Data Exploration Functions
 """
