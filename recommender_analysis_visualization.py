@@ -82,6 +82,8 @@ class MyRecommender:
         self.input_columns_ = None
         self.preprocessor_ = None
         self.feature_importance_ = None
+        self.user_encoders_ = {}
+        self.item_encoders_ = {}
         
         # Set random seed for reproducibility
         if seed is not None:
@@ -90,53 +92,139 @@ class MyRecommender:
 
     def _create_interaction_features(self, feature_df):
         """Create interaction features between user and item attributes."""
-        # Create price sensitivity feature
+        # Price sensitivity features
         if 'u_income' in feature_df.columns and 'i_price' in feature_df.columns:
             feature_df['price_sensitivity'] = feature_df['i_price'] / (feature_df['u_income'] + 1)
+            feature_df['price_affordability'] = feature_df['u_income'] / (feature_df['i_price'] + 1)
+            try:
+                feature_df['price_range_match'] = pd.qcut(feature_df['i_price'], q=5, labels=['very_low', 'low', 'medium', 'high', 'very_high'])
+            except ValueError:
+                # If all prices are the same, assign a default category
+                feature_df['price_range_match'] = 'medium'
         
-        # Create category preference features
+        # Category preference features
         if 'u_segment' in feature_df.columns and 'i_category' in feature_df.columns:
             feature_df['segment_category_match'] = (feature_df['u_segment'] == feature_df['i_category']).astype(int)
+            # Create one-hot encoded category features
+            feature_df['is_electronics'] = (feature_df['i_category'] == 'electronics').astype(int)
+            feature_df['is_books'] = (feature_df['i_category'] == 'books').astype(int)
+            feature_df['is_clothing'] = (feature_df['i_category'] == 'clothing').astype(int)
+            feature_df['is_home'] = (feature_df['i_category'] == 'home').astype(int)
         
-        # Create price range features
-        if 'i_price' in feature_df.columns:
-            feature_df['price_range'] = pd.qcut(feature_df['i_price'], q=5, labels=['very_low', 'low', 'medium', 'high', 'very_high'])
+        # User segment features
+        if 'u_segment' in feature_df.columns:
+            feature_df['is_budget'] = (feature_df['u_segment'] == 'budget').astype(int)
+            feature_df['is_mainstream'] = (feature_df['u_segment'] == 'mainstream').astype(int)
+            feature_df['is_premium'] = (feature_df['u_segment'] == 'premium').astype(int)
+        
+        # Interaction history features
+        if 'u_user_interaction_count' in feature_df.columns:
+            try:
+                # Try to create quantile-based bins
+                feature_df['user_activity_level'] = pd.qcut(
+                    feature_df['u_user_interaction_count'], 
+                    q=5, 
+                    labels=['very_low', 'low', 'medium', 'high', 'very_high'],
+                    duplicates='drop'  # Drop duplicate edges
+                )
+            except ValueError:
+                # If qcut fails, use simple binning based on value ranges
+                max_count = feature_df['u_user_interaction_count'].max()
+                if max_count <= 1:
+                    feature_df['user_activity_level'] = 'very_low'
+                elif max_count <= 3:
+                    feature_df['user_activity_level'] = pd.cut(
+                        feature_df['u_user_interaction_count'],
+                        bins=[0, 1, 2, 3],
+                        labels=['very_low', 'low', 'medium']
+                    )
+                else:
+                    feature_df['user_activity_level'] = pd.cut(
+                        feature_df['u_user_interaction_count'],
+                        bins=[0, 1, 3, 5, float('inf')],
+                        labels=['very_low', 'low', 'medium', 'high']
+                    )
+        
+        if 'i_item_popularity' in feature_df.columns:
+            try:
+                # Try to create quantile-based bins
+                feature_df['item_popularity_level'] = pd.qcut(
+                    feature_df['i_item_popularity'], 
+                    q=5, 
+                    labels=['very_low', 'low', 'medium', 'high', 'very_high'],
+                    duplicates='drop'  # Drop duplicate edges
+                )
+            except ValueError:
+                # If qcut fails, use simple binning based on value ranges
+                max_popularity = feature_df['i_item_popularity'].max()
+                if max_popularity <= 1:
+                    feature_df['item_popularity_level'] = 'very_low'
+                elif max_popularity <= 3:
+                    feature_df['item_popularity_level'] = pd.cut(
+                        feature_df['i_item_popularity'],
+                        bins=[0, 1, 2, 3],
+                        labels=['very_low', 'low', 'medium']
+                    )
+                else:
+                    feature_df['item_popularity_level'] = pd.cut(
+                        feature_df['i_item_popularity'],
+                        bins=[0, 1, 3, 5, float('inf')],
+                        labels=['very_low', 'low', 'medium', 'high']
+                    )
+        
+        # Create polynomial features for important numeric columns
+        numeric_cols = ['u_income', 'i_price', 'u_user_avg_relevance', 'i_item_avg_relevance']
+        for col in numeric_cols:
+            if col in feature_df.columns:
+                feature_df[f'{col}_squared'] = feature_df[col] ** 2
         
         return feature_df
 
     def _create_aggregate_features(self, log_df, user_features, item_features):
         """Create aggregate features from historical interactions."""
-        # User interaction counts
-        user_counts = log_df.groupBy("user_idx").count().withColumnRenamed("count", "user_interaction_count")
-        
-        # Item popularity
-        item_counts = log_df.groupBy("item_idx").count().withColumnRenamed("count", "item_popularity")
-        
-        # Average relevance by user
-        user_avg_relevance = log_df.groupBy("user_idx").agg(
-            sf.avg("relevance").alias("user_avg_relevance")
+        # User interaction counts and statistics
+        user_stats = log_df.groupBy("user_idx").agg(
+            sf.count("*").alias("user_interaction_count"),
+            sf.avg("relevance").alias("user_avg_relevance"),
+            sf.stddev("relevance").alias("user_relevance_std"),
+            sf.max("relevance").alias("user_max_relevance")
         )
         
-        # Average relevance by item
-        item_avg_relevance = log_df.groupBy("item_idx").agg(
-            sf.avg("relevance").alias("item_avg_relevance")
+        # Item popularity and statistics
+        item_stats = log_df.groupBy("item_idx").agg(
+            sf.count("*").alias("item_popularity"),
+            sf.avg("relevance").alias("item_avg_relevance"),
+            sf.stddev("relevance").alias("item_relevance_std"),
+            sf.max("relevance").alias("item_max_relevance")
         )
         
-        return user_counts, item_counts, user_avg_relevance, item_avg_relevance
+        # Category-level statistics
+        if 'category' in item_features.columns:
+            category_stats = log_df.join(
+                item_features.select("item_idx", "category"),
+                on="item_idx"
+            ).groupBy("category").agg(
+                sf.avg("relevance").alias("category_avg_relevance"),
+                sf.count("*").alias("category_popularity")
+            )
+            
+            # Join category stats back to items
+            item_features = item_features.join(
+                category_stats,
+                on="category",
+                how="left"
+            )
+        
+        return user_stats, item_stats
 
     def fit(self, log, user_features=None, item_features=None):
         """Train the recommender model with enhanced features."""
         # Create aggregate features
-        user_counts, item_counts, user_avg_relevance, item_avg_relevance = self._create_aggregate_features(
-            log, user_features, item_features
-        )
+        user_stats, item_stats = self._create_aggregate_features(log, user_features, item_features)
         
         # Join features with user and item data
-        user_features = user_features.join(user_counts, on="user_idx", how="left")
-        user_features = user_features.join(user_avg_relevance, on="user_idx", how="left")
-        
-        item_features = item_features.join(item_counts, on="item_idx", how="left")
-        item_features = item_features.join(item_avg_relevance, on="item_idx", how="left")
+        user_features = user_features.join(user_stats, on="user_idx", how="left")
+        item_features = item_features.join(item_stats, on="item_idx", how="left")
         
         # Add prefixes to features
         user_features = user_features.select(
@@ -173,7 +261,9 @@ class MyRecommender:
         
         # Handle missing values and ensure proper types
         for col in categorical_cols:
-            feature_df[col] = feature_df[col].fillna('missing').astype(str)
+            feature_df[col] = feature_df[col].astype(str)
+            feature_df[col] = feature_df[col].fillna('missing')
+            
         for col in numeric_cols:
             feature_df[col] = pd.to_numeric(feature_df[col], errors='coerce').fillna(0)
         
@@ -189,30 +279,41 @@ class MyRecommender:
         feature_df = feature_df.reindex(columns=self.input_columns_)
         X_transformed = preprocessor.fit_transform(feature_df)
         
-        # Train model with cross-validation
-        from sklearn.ensemble import RandomForestRegressor
+        # Convert relevance to binary (0 or 1)
+        y = (joined_pd["relevance"] > 0).astype(int)
+        
+        # Train model with L1 regularization
+        from sklearn.linear_model import LogisticRegression
         from sklearn.model_selection import GridSearchCV
         
         param_grid = {
-            'n_estimators': [100, 200],
-            'max_depth': [10, 20, None],
-            'min_samples_split': [2, 5],
-            'min_samples_leaf': [1, 2]
+            'C': [0.01, 0.1, 1.0, 10.0],  # Inverse of regularization strength
+            'penalty': ['l1'],
+            'solver': ['liblinear'],  # liblinear is efficient for L1 regularization
+            'max_iter': [1000],
+            'class_weight': ['balanced', None]
         }
         
-        base_model = RandomForestRegressor(random_state=self.seed)
+        base_model = LogisticRegression(random_state=self.seed)
         grid_search = GridSearchCV(
-            base_model, param_grid, cv=3, scoring='neg_mean_squared_error', n_jobs=-1
+            base_model, param_grid, cv=3, scoring='f1', n_jobs=-1
         )
         
-        y = joined_pd["relevance"].values
         grid_search.fit(X_transformed, y)
         
         # Save best model and feature importance
         self.model = grid_search.best_estimator_
+        
+        # Get feature names after one-hot encoding
+        feature_names = (
+            preprocessor.named_transformers_['cat'].get_feature_names_out(categorical_cols).tolist() +
+            numeric_cols
+        )
+        
+        # Calculate feature importance (absolute coefficient values)
         self.feature_importance_ = dict(zip(
-            self.input_columns_,
-            self.model.feature_importances_
+            feature_names,
+            np.abs(self.model.coef_[0])
         ))
         
         # Save preprocessor
@@ -226,20 +327,15 @@ class MyRecommender:
             reverse=True
         )[:10]:
             print(f"{feature}: {importance:.4f}")
-
+    
     def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
         """Generate recommendations with enhanced features."""
         # Create aggregate features
-        user_counts, item_counts, user_avg_relevance, item_avg_relevance = self._create_aggregate_features(
-            log, user_features, item_features
-        )
+        user_stats, item_stats = self._create_aggregate_features(log, user_features, item_features)
         
         # Join features
-        user_features = user_features.join(user_counts, on="user_idx", how="left")
-        user_features = user_features.join(user_avg_relevance, on="user_idx", how="left")
-        
-        item_features = item_features.join(item_counts, on="item_idx", how="left")
-        item_features = item_features.join(item_avg_relevance, on="item_idx", how="left")
+        user_features = user_features.join(user_stats, on="user_idx", how="left")
+        item_features = item_features.join(item_stats, on="item_idx", how="left")
         
         # Add prefixes
         user_features = user_features.select(
@@ -274,13 +370,15 @@ class MyRecommender:
         
         # Handle missing values and types
         for col in self.categorical_cols_:
-            feature_df[col] = feature_df[col].fillna('missing').astype(str)
+            feature_df[col] = feature_df[col].astype(str)
+            feature_df[col] = feature_df[col].fillna('missing')
+            
         for col in self.numeric_cols_:
             feature_df[col] = pd.to_numeric(feature_df[col], errors='coerce').fillna(0)
         
         # Transform and predict
         X_rec = self.preprocessor_.transform(feature_df)
-        preds = self.model.predict(X_rec)
+        preds = self.model.predict_proba(X_rec)[:, 1]  # Get probability of positive class
         
         # Create final recommendations
         scored = ids.copy()
@@ -300,9 +398,6 @@ class MyRecommender:
         )
         
         return ranked
-        
-        
-
 
 
 # Cell: Data Exploration Functions
