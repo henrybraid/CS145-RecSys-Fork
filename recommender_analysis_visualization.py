@@ -24,6 +24,7 @@ from pyspark.sql.types import DoubleType, ArrayType
 from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import GridSearchCV
 
 # Set up plotting
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -91,88 +92,126 @@ class MyRecommender:
             random.seed(seed)
 
     def _create_interaction_features(self, feature_df):
-        """Create interaction features between user and item attributes."""
-        # Price sensitivity features
+        """Create enhanced interaction features between user and item attributes."""
+        # First create all base features
         if 'u_income' in feature_df.columns and 'i_price' in feature_df.columns:
+            # Basic price features
             feature_df['price_sensitivity'] = feature_df['i_price'] / (feature_df['u_income'] + 1)
             feature_df['price_affordability'] = feature_df['u_income'] / (feature_df['i_price'] + 1)
-            feature_df['price_range_match'] = pd.qcut(feature_df['i_price'], q=5, labels=['very_low', 'low', 'medium', 'high', 'very_high'])
-            
-            # Add price elasticity features
             feature_df['price_elasticity'] = feature_df['price_sensitivity'] * feature_df['price_affordability']
-            feature_df['price_category_match'] = feature_df['price_range_match'].astype(str) + '_' + feature_df['i_category'].astype(str)
+            feature_df['price_income_interaction'] = feature_df['i_price'] * feature_df['u_income']
+            
+            # Price range features with safe binning
+            try:
+                price_bins = np.percentile(feature_df['i_price'], [0, 20, 40, 60, 80, 100])
+                if len(np.unique(price_bins)) > 1:  # Only create bins if values are different
+                    feature_df['price_range'] = pd.cut(
+                        feature_df['i_price'],
+                        bins=price_bins,
+                        labels=['very_low', 'low', 'medium', 'high', 'very_high']
+                    )
+                else:
+                    feature_df['price_range'] = 'medium'  # Default value if all prices are the same
+            except Exception:
+                feature_df['price_range'] = 'medium'  # Fallback if binning fails
         
-        # Category preference features
-        if 'u_segment' in feature_df.columns and 'i_category' in feature_df.columns:
-            feature_df['segment_category_match'] = (feature_df['u_segment'] == feature_df['i_category']).astype(int)
-            # Create one-hot encoded category features
-            feature_df['is_electronics'] = (feature_df['i_category'] == 'electronics').astype(int)
-            feature_df['is_books'] = (feature_df['i_category'] == 'books').astype(int)
-            feature_df['is_clothing'] = (feature_df['i_category'] == 'clothing').astype(int)
-            feature_df['is_home'] = (feature_df['i_category'] == 'home').astype(int)
-        
-        # User segment features
+        # Create segment-specific features
         if 'u_segment' in feature_df.columns:
-            feature_df['is_budget'] = (feature_df['u_segment'] == 'budget').astype(int)
-            feature_df['is_mainstream'] = (feature_df['u_segment'] == 'mainstream').astype(int)
-            feature_df['is_premium'] = (feature_df['u_segment'] == 'premium').astype(int)
+            # Segment-specific price sensitivity (after price_sensitivity is created)
+            if 'price_sensitivity' in feature_df.columns:
+                segment_price_means = feature_df.groupby('u_segment')['price_sensitivity'].mean().reset_index()
+                segment_price_means = segment_price_means.rename(columns={'price_sensitivity': 'segment_price_sensitivity'})
+                feature_df = feature_df.merge(segment_price_means, on='u_segment', how='left')
+            
+            # Segment-specific category preferences
+            if 'price_affordability' in feature_df.columns:
+                for segment in feature_df['u_segment'].unique():
+                    feature_df[f'segment_{segment}_price_match'] = (
+                        (feature_df['u_segment'] == segment) * 
+                        feature_df['price_affordability']
+                    )
         
-        # Interaction history features
+        # Create category features
+        if 'u_segment' in feature_df.columns and 'i_category' in feature_df.columns:
+            # Category preference scores - using user_idx instead of user_id
+            if 'user_idx' in feature_df.columns and 'relevance' in feature_df.columns:
+                feature_df['category_preference_score'] = feature_df.groupby(['user_idx', 'i_category'])['relevance'].transform('mean')
+                feature_df['category_exploration_score'] = feature_df.groupby(['user_idx', 'i_category'])['relevance'].transform('count')
+            
+            # Segment-category interaction strength
+            segment_category_means = feature_df.groupby(['u_segment', 'i_category'])['relevance'].mean().reset_index()
+            segment_category_means = segment_category_means.rename(columns={'relevance': 'segment_category_strength'})
+            feature_df = feature_df.merge(segment_category_means, on=['u_segment', 'i_category'], how='left')
+            
+            # Category diversity score
+            if 'user_idx' in feature_df.columns:
+                feature_df['category_diversity'] = feature_df.groupby('user_idx')['i_category'].transform('nunique')
+            
+            # Price category interaction (after price_range is created)
+            if 'price_range' in feature_df.columns:
+                feature_df['price_category_match'] = feature_df['price_range'].astype(str) + '_' + feature_df['i_category'].astype(str)
+        
+        # Create user engagement features
         if 'u_user_interaction_count' in feature_df.columns:
-            try:
-                # Try to create quantile-based bins
-                feature_df['user_activity_level'] = pd.qcut(
-                    feature_df['u_user_interaction_count'], 
-                    q=5, 
-                    labels=['very_low', 'low', 'medium', 'high', 'very_high'],
-                    duplicates='drop'  # Drop duplicate edges
+            # User engagement metrics
+            if 'u_user_avg_relevance' in feature_df.columns:
+                feature_df['user_engagement_score'] = (
+                    feature_df['u_user_interaction_count'] * 
+                    feature_df['u_user_avg_relevance']
                 )
-            except ValueError:
-                # If qcut fails, use simple binning based on value ranges
-                max_count = feature_df['u_user_interaction_count'].max()
-                if max_count <= 1:
-                    feature_df['user_activity_level'] = 'very_low'
-                elif max_count <= 3:
+            
+            # User exploration score
+            if 'i_category' in feature_df.columns and 'user_idx' in feature_df.columns:
+                feature_df['user_exploration_score'] = (
+                    feature_df['u_user_interaction_count'] / 
+                    feature_df.groupby('user_idx')['i_category'].transform('nunique')
+                )
+            
+            # Activity level with safe binning
+            try:
+                activity_bins = np.percentile(feature_df['u_user_interaction_count'], [0, 20, 40, 60, 80, 100])
+                if len(np.unique(activity_bins)) > 1:  # Only create bins if values are different
                     feature_df['user_activity_level'] = pd.cut(
                         feature_df['u_user_interaction_count'],
-                        bins=[0, 1, 2, 3],
-                        labels=['very_low', 'low', 'medium']
+                        bins=activity_bins,
+                        labels=['very_low', 'low', 'medium', 'high', 'very_high']
                     )
                 else:
-                    feature_df['user_activity_level'] = pd.cut(
-                        feature_df['u_user_interaction_count'],
-                        bins=[0, 1, 3, 5, float('inf')],
-                        labels=['very_low', 'low', 'medium', 'high']
-                    )
+                    feature_df['user_activity_level'] = 'medium'  # Default value if all counts are the same
+            except Exception:
+                feature_df['user_activity_level'] = 'medium'  # Fallback if binning fails
         
+        # Create item engagement features
         if 'i_item_popularity' in feature_df.columns:
-            try:
-                # Try to create quantile-based bins
-                feature_df['item_popularity_level'] = pd.qcut(
-                    feature_df['i_item_popularity'], 
-                    q=5, 
-                    labels=['very_low', 'low', 'medium', 'high', 'very_high'],
-                    duplicates='drop'  # Drop duplicate edges
+            # Item engagement metrics
+            if 'i_item_avg_relevance' in feature_df.columns:
+                feature_df['item_engagement_score'] = (
+                    feature_df['i_item_popularity'] * 
+                    feature_df['i_item_avg_relevance']
                 )
-            except ValueError:
-                # If qcut fails, use simple binning based on value ranges
-                max_popularity = feature_df['i_item_popularity'].max()
-                if max_popularity <= 1:
-                    feature_df['item_popularity_level'] = 'very_low'
-                elif max_popularity <= 3:
+            
+            # Item diversity score
+            if 'u_segment' in feature_df.columns and 'item_idx' in feature_df.columns:
+                feature_df['item_diversity_score'] = (
+                    feature_df['i_item_popularity'] / 
+                    feature_df.groupby('item_idx')['u_segment'].transform('nunique')
+                )
+            
+            # Popularity level with safe binning
+            try:
+                popularity_bins = np.percentile(feature_df['i_item_popularity'], [0, 20, 40, 60, 80, 100])
+                if len(np.unique(popularity_bins)) > 1:  # Only create bins if values are different
                     feature_df['item_popularity_level'] = pd.cut(
                         feature_df['i_item_popularity'],
-                        bins=[0, 1, 2, 3],
-                        labels=['very_low', 'low', 'medium']
+                        bins=popularity_bins,
+                        labels=['very_low', 'low', 'medium', 'high', 'very_high']
                     )
                 else:
-                    feature_df['item_popularity_level'] = pd.cut(
-                        feature_df['i_item_popularity'],
-                        bins=[0, 1, 3, 5, float('inf')],
-                        labels=['very_low', 'low', 'medium', 'high']
-                    )
+                    feature_df['item_popularity_level'] = 'medium'  # Default value if all popularities are the same
+            except Exception:
+                feature_df['item_popularity_level'] = 'medium'  # Fallback if binning fails
         
-        # Create polynomial features for important numeric columns
+        # Create polynomial features
         numeric_cols = ['u_income', 'i_price', 'u_user_avg_relevance', 'i_item_avg_relevance']
         for col in numeric_cols:
             if col in feature_df.columns:
@@ -219,7 +258,7 @@ class MyRecommender:
         return user_stats, item_stats
     
     def fit(self, log, user_features=None, item_features=None):
-        """Train the recommender model with enhanced features."""
+        """Train the recommender model with enhanced features and preprocessing."""
         # Create aggregate features
         user_stats, item_stats = self._create_aggregate_features(log, user_features, item_features)
         
@@ -248,12 +287,17 @@ class MyRecommender:
         joined_pd = joined.toPandas()
         
         # Create interaction features
-        feature_df = joined_pd.drop(columns=["user_idx", "item_idx", "relevance"])
+        feature_df = joined_pd.copy()  # Keep all columns including IDs
         feature_df = self._create_interaction_features(feature_df)
         
         # Split columns by dtype
         categorical_cols = feature_df.select_dtypes(include=["object", "category"]).columns.tolist()
         numeric_cols = feature_df.select_dtypes(include=["int64", "float64", "int32", "float32"]).columns.tolist()
+        
+        # Remove ID columns from feature sets
+        id_cols = ['user_idx', 'item_idx']
+        categorical_cols = [col for col in categorical_cols if col not in id_cols]
+        numeric_cols = [col for col in numeric_cols if col not in id_cols]
         
         # Save column information
         self.categorical_cols_ = categorical_cols
@@ -268,11 +312,23 @@ class MyRecommender:
         for col in numeric_cols:
             feature_df[col] = pd.to_numeric(feature_df[col], errors='coerce').fillna(0)
         
-        # Create preprocessing pipeline
+        # Create preprocessing pipeline with scaling
+        from sklearn.preprocessing import StandardScaler, OneHotEncoder
+        from sklearn.compose import ColumnTransformer
+        from sklearn.pipeline import Pipeline
+        
+        numeric_transformer = Pipeline(steps=[
+            ('scaler', StandardScaler())
+        ])
+        
+        categorical_transformer = Pipeline(steps=[
+            ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+        ])
+        
         preprocessor = ColumnTransformer(
             transformers=[
-                ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), categorical_cols),
-                ("num", "passthrough", numeric_cols),
+                ('num', numeric_transformer, numeric_cols),
+                ('cat', categorical_transformer, categorical_cols)
             ]
         )
         
@@ -283,17 +339,14 @@ class MyRecommender:
         # Convert relevance to binary (0 or 1)
         y = (joined_pd["relevance"] > 0).astype(int)
         
-        # Train model with improved regularization
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.model_selection import GridSearchCV
-        
+        # Enhanced parameter grid for Elastic Net
         param_grid = {
-            'C': [0.1, 1.0, 10.0],  # Reduced parameter space
+            'C': [0.01, 0.1, 1.0, 10.0],
             'penalty': ['elasticnet'],
-            'l1_ratio': [0.3, 0.5, 0.7],  # Reduced L1/L2 mixing options
-            'solver': ['saga'],  # SAGA is required for elasticnet
-            'max_iter': [2000],  # Increased for better convergence
-            'tol': [1e-3],  # Relaxed tolerance
+            'l1_ratio': [0.1, 0.3, 0.5, 0.7, 0.9],
+            'solver': ['saga'],
+            'max_iter': [2000],
+            'tol': [1e-3],
             'class_weight': ['balanced']
         }
         
@@ -301,12 +354,12 @@ class MyRecommender:
             random_state=self.seed,
             max_iter=2000,
             tol=1e-3,
-            warm_start=True  # Enable warm start for better convergence
+            warm_start=True
         )
         
-        # Use simpler cross-validation
-        from sklearn.model_selection import KFold
-        cv = KFold(n_splits=3, shuffle=True, random_state=self.seed)
+        # Use stratified cross-validation
+        from sklearn.model_selection import StratifiedKFold
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=self.seed)
         
         grid_search = GridSearchCV(
             base_model, 
@@ -314,24 +367,19 @@ class MyRecommender:
             cv=cv,
             scoring='f1',
             verbose=1,
-            n_jobs=1  # Disable parallel processing to avoid memory issues
+            n_jobs=1
         )
         
         # Save preprocessor
         self.preprocessor_ = preprocessor
         
-        # Get feature names after one-hot encoding
+        # Get feature names after transformation
         feature_names = (
-            preprocessor.named_transformers_['cat'].get_feature_names_out(categorical_cols).tolist() +
+            preprocessor.named_transformers_['cat'].named_steps['onehot'].get_feature_names_out(categorical_cols).tolist() +
             numeric_cols
         )
         
-        # Scale the features to help with convergence
-        from sklearn.preprocessing import StandardScaler
-        scaler = StandardScaler()
-        X_transformed_scaled = scaler.fit_transform(X_transformed)
-        
-        # Add feature selection to reduce dimensionality
+        # Add feature selection
         from sklearn.feature_selection import SelectFromModel
         selector = SelectFromModel(
             LogisticRegression(penalty='l1', solver='liblinear', C=0.1),
@@ -340,14 +388,13 @@ class MyRecommender:
         )
         
         # Fit selector and transform features
-        X_transformed_selected = selector.fit_transform(X_transformed_scaled, y)
+        X_transformed_selected = selector.fit_transform(X_transformed, y)
         
         # Fit the model
         grid_search.fit(X_transformed_selected, y)
         
         # Save models and transformers
         self.model = grid_search.best_estimator_
-        self.scaler_ = scaler
         self.selector_ = selector
         
         # Get feature names after selection
@@ -411,16 +458,26 @@ class MyRecommender:
         
         # Handle missing values and types
         for col in self.categorical_cols_:
-            feature_df[col] = feature_df[col].astype(str)
-            feature_df[col] = feature_df[col].fillna('missing')
+            if col in feature_df.columns:
+                feature_df[col] = feature_df[col].astype(str)
+                feature_df[col] = feature_df[col].fillna('missing')
             
         for col in self.numeric_cols_:
-            feature_df[col] = pd.to_numeric(feature_df[col], errors='coerce').fillna(0)
+            if col in feature_df.columns:
+                feature_df[col] = pd.to_numeric(feature_df[col], errors='coerce').fillna(0)
+        
+        # Ensure all required columns are present
+        required_columns = set(self.categorical_cols_ + self.numeric_cols_)
+        missing_columns = required_columns - set(feature_df.columns)
+        for col in missing_columns:
+            if col in self.categorical_cols_:
+                feature_df[col] = 'missing'
+            else:
+                feature_df[col] = 0
         
         # Transform and predict
         X_rec = self.preprocessor_.transform(feature_df)
-        X_rec_scaled = self.scaler_.transform(X_rec)
-        X_rec_selected = self.selector_.transform(X_rec_scaled)
+        X_rec_selected = self.selector_.transform(X_rec)
         preds = self.model.predict_proba(X_rec_selected)[:, 1]
         
         # Create final recommendations
