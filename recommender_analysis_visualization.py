@@ -21,6 +21,8 @@ from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.linalg import Vectors, VectorUDT
 from pyspark.sql.types import DoubleType, ArrayType
 
+from sklearn.tree import DecisionTreeClassifier
+
 # Set up plotting
 plt.style.use('seaborn-v0_8-whitegrid')
 sns.set_style('whitegrid')
@@ -53,6 +55,67 @@ from config import DEFAULT_CONFIG, EVALUATION_METRICS
 Below is a template class for implementing a custom recommender system.
 Students should extend this class with their own recommendation algorithm.
 """
+
+class DecisionTreeRecommender:
+    def __init__(self, max_depth=5, min_samples_leaf=10):
+        self.model = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_samples_leaf)
+        self.feature_cols = None
+        self.user_cols = []
+        self.item_cols = []
+        
+    def helper_prepare_features(self, df, fit=False):
+        # helps features be one-hot encoded and with column alignment
+        df = pd.get_dummies(df)
+        if fit:
+            self.feature_cols = df.columns.tolist()
+        else:
+            for col in self.feature_cols:
+                if col not in df.columns:
+                    df[col] = 0
+            df = df[self.feature_cols]
+        return df
+
+    def fit(self, log, user_features=None, item_features=None):
+        log_pd = log.toPandas()
+        user_pd = user_features.toPandas()
+        item_pd = item_features.toPandas()
+
+        # this lets us merge interactions with user/item features
+        df = log_pd.merge(user_pd, on="user_idx")
+        df = df.merge(item_pd, on="item_idx")
+
+        self.user_cols = [c for c in user_pd.columns if c != "user_idx"]
+        self.item_cols = [c for c in item_pd.columns if c != "item_idx"]
+        feature_df = df[self.user_cols + self.item_cols]
+
+        X = self.helper_prepare_features(feature_df, fit=True)
+        y = df["relevance"]
+
+        self.model.fit(X, y)
+
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        users_pd = user_features.toPandas()
+        items_pd = item_features.toPandas()
+
+        # this creates user-item pairs
+        user_item_pairs = users_pd.assign(key=1).merge(items_pd.assign(key=1), on="key").drop("key", axis=1)
+        feature_df = user_item_pairs[self.user_cols + self.item_cols]
+
+        X_pred = self.helper_prepare_features(feature_df, fit=False)
+        user_item_pairs["relevance"] = self.model.predict_proba(X_pred)[:, 1]
+
+        if filter_seen_items and log is not None:
+            seen = log.select("user_idx", "item_idx").toPandas()
+            seen["seen"] = 1
+            user_item_pairs = user_item_pairs.merge(seen, how="left", on=["user_idx", "item_idx"])
+            user_item_pairs = user_item_pairs[user_item_pairs["seen"] != 1].drop(columns=["seen"])
+
+        # rank and return top-k
+        user_item_pairs["rank"] = user_item_pairs.groupby("user_idx")["relevance"]\
+                                                 .rank(method="first", ascending=False)
+        top_k = user_item_pairs[user_item_pairs["rank"] <= k]
+
+        return self.spark.createDataFrame(top_k[["user_idx", "item_idx", "relevance"]])
 
 class MyRecommender:
     """
@@ -448,9 +511,10 @@ def run_recommender_analysis():
         RandomRecommender(seed=42),
         PopularityRecommender(alpha=1.0, seed=42),
         ContentBasedRecommender(similarity_threshold=0.0, seed=42),
-        MyRecommender(seed=42)  # Add your custom recommender here
+        MyRecommender(seed=42),  # Add your custom recommender here
+        DecisionTreeRecommender(max_depth=5, min_samples_leaf=10)
     ]
-    recommender_names = ["Random", "Popularity", "ContentBased", "MyRecommender"]
+    recommender_names = ["Random", "Popularity", "ContentBased", "MyRecommender", "DecisionTree"]
     
     # Initialize recommenders with initial history
     for recommender in recommenders:
