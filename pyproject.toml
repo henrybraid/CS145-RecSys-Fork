@@ -10,4 +10,7 @@ dependencies = [
     "pyspark>=3.5.5",
     "sdv>=0.18,<0.19",
     "seaborn>=0.13.2",
+    "torch==2.2.2",
+    "matplotlib>=3.7.0",
+    "scikit-learn>=1.3.0"
 ]
