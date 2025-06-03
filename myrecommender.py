@@ -19,7 +19,7 @@ from sklearn.model_selection import train_test_split, GridSearchCV
 from sim4rec.utils import pandas_to_spark
 
 import xgboost as xgb
-from xgboost import XGBClassifier
+from xgboost import XGBClassifier, callback
 
 """
 ## MyRecommender Template
@@ -121,24 +121,28 @@ class MyRecommender:
 
         return features_transformed
 
-    def _get_best_model(self, X, y):
+    def _get_best_model(self, X,y):
+        #Best params so far: 31% increase, commented on each side
         param_grid = {
-            "n_estimators": [25, 50, 100, 200],
-            "learning_rate": [0.01, 0.05],
-            "max_depth": [4, 8, 16],
-            "min_child_weight": [1, 5, 10],
+            "n_estimators": [10, 25, 100], #25
+            "learning_rate": [0.001, 0.01], #0.01
+            "max_depth": [2, 4], #4
+            "min_child_weight": [4, 5, 6], #5
+            'reg_lambda':[1.0], #when using other regularization, performance decreased
         }
         base_model = XGBClassifier(
                     objective="binary:logistic", 
+                    booster='gbtree',
                     random_state = self.seed, 
                     tree_method = 'hist',
+                    eval_metric='logloss',
                     n_jobs = 4)
         grid_search = GridSearchCV(
             base_model, param_grid, 
             cv = 3, 
             scoring = 'neg_mean_squared_error',
             n_jobs = 1)
-        grid_search.fit(X, y)
+        grid_search.fit(X, y,verbose=True)
 
         self.best_params = grid_search.best_params_
 
@@ -168,18 +172,26 @@ class MyRecommender:
             X = self._preprocess_features(features)
             y = pd_log['relevance'].values
 
-            #self.model = self._get_best_model(X,y)
             if self.model is None:
+                #Perform grid search to get the best model on first fit. Then, use this model for the rest of training.
                 self.model = self._get_best_model(X,y)
                 print(f'\nBest parameters: {self.best_params}\n')
 
             else:
+                #Apply early stopping to the training iterations after determining the best model
+                X_train, X_test, y_train, y_test = train_test_split(X,y, test_size=0.25, random_state=self.seed)
+                
                 self.model = XGBClassifier(
                             **self.best_params,
                             random_state=self.seed,
-                            tree_method="hist")  
-                self.model.fit(X,y) 
-
+                            booster='gbtree',
+                            tree_method='hist',
+                            eval_metric='logloss',
+                            early_stopping_rounds = 5, #Does not even happen, because the 25 estimators is already performing well
+                            n_jobs=4)
+                self.model.fit(X_train,y_train, 
+                               eval_set = [(X_test, y_test)],
+                               verbose=True)
     
     def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
         """
