@@ -46,7 +46,7 @@ from sample_recommenders import (
     ContentBasedRecommender, 
     SVMRecommender, 
 )
-from myrecommender import MyRecommender
+from myrecommender import GradientBoost
 from config import DEFAULT_CONFIG, EVALUATION_METRICS
 
 # Cell: Data Exploration Functions
@@ -357,9 +357,9 @@ def run_recommender_analysis():
         RandomRecommender(seed=42),
         PopularityRecommender(alpha=1.0, seed=42),
         ContentBasedRecommender(similarity_threshold=0.0, seed=42),
-        MyRecommender(seed=42)  # Add your custom recommender here
+        GradientBoost(seed=42)  # Add your custom recommender here
     ]
-    recommender_names = ["SVM", "Random", "Popularity", "ContentBased", "MyRecommender"]
+    recommender_names = ["SVM", "Random", "Popularity", "ContentBased", "GradientBoost"]
     
     # Initialize recommenders with initial history
     for recommender in recommenders:

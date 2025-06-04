@@ -27,7 +27,7 @@ Below is a template class for implementing a custom recommender system.
 Students should extend this class with their own recommendation algorithm.
 """
 
-class MyRecommender:
+class GradientBoost:
     """
     Template class for implementing a custom recommender.
     
