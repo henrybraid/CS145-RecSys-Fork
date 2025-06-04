@@ -382,74 +382,127 @@ class MyRecommender:
         # Convert relevance to binary (0 or 1)
         y = (joined["relevance"] > 0).astype(int)
         
-        # Enhanced parameter grid for Elastic Net
+        # Split data for validation
+        from sklearn.model_selection import train_test_split
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_transformed, y, test_size=0.2, random_state=self.seed, stratify=y
+        )
+        
+        # Enhanced parameter grid for L2 regularization with adaptive C values
         param_grid = {
-            'C': [0.01, 0.1, 1.0, 10.0],
-            'penalty': ['elasticnet'],
-            'l1_ratio': [0.1, 0.3, 0.5, 0.7, 0.9],
-            'solver': ['saga'],
+            'C': [0.0001, 0.001, 0.01, 0.1, 0.5, 1.0],  # Wider range of C values
+            'penalty': ['l2'],
+            'solver': ['liblinear'],
             'max_iter': [2000],
-            'tol': [1e-3],
+            'tol': [1e-4],
             'class_weight': ['balanced']
         }
         
         base_model = LogisticRegression(
             random_state=self.seed,
             max_iter=2000,
-            tol=1e-3,
+            tol=1e-4,
             warm_start=True
         )
         
-        # Use stratified cross-validation
+        # Use stratified cross-validation with more folds
         from sklearn.model_selection import StratifiedKFold
-        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=self.seed)
+        cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=self.seed)
         
-        grid_search = GridSearchCV(
-            base_model, 
-            param_grid, 
-            cv=cv,
-            scoring='f1',
-            verbose=1,
-            n_jobs=1
+        # Custom scoring function that considers both classification and revenue
+        def revenue_scorer(estimator, X, y):
+            y_pred = estimator.predict_proba(X)[:, 1]
+            # Calculate revenue score with additional regularization penalty
+            revenue_score = np.mean(y_pred * y)
+            # Add L2 penalty based on feature importance
+            coef = np.abs(estimator.coef_[0])
+            l2_penalty = np.mean(coef ** 2)  # Mean squared coefficients
+            # Add stability penalty
+            stability_penalty = np.std(coef)  # Penalize high variance in coefficients
+            return revenue_score - 0.1 * l2_penalty - 0.05 * stability_penalty
+        
+        # Ensemble feature selection
+        from sklearn.feature_selection import SelectFromModel
+        from sklearn.ensemble import RandomForestClassifier
+        
+        # First pass: Use Random Forest for initial feature importance
+        rf_selector = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=5,
+            random_state=self.seed
+        )
+        rf_selector.fit(X_train, y_train)
+        rf_importance = rf_selector.feature_importances_
+        
+        # Second pass: Use L2-based selection with RF importance as weights
+        l2_selector = SelectFromModel(
+            LogisticRegression(penalty='l2', solver='liblinear', C=0.01),
+            prefit=False,
+            threshold='median'
         )
         
-        # Save preprocessor
-        self.preprocessor_ = preprocessor
-        
-        # Get feature names after transformation
+        # Combine feature importances
         feature_names = (
             preprocessor.named_transformers_['cat'].named_steps['onehot'].get_feature_names_out(categorical_cols).tolist() +
             numeric_cols
         )
         
-        # Add feature selection
-        from sklearn.feature_selection import SelectFromModel
-        selector = SelectFromModel(
-            LogisticRegression(penalty='l1', solver='liblinear', C=0.1),
-            prefit=False,
-            threshold='median'
+        # Weight features by both RF and L2 importance
+        combined_importance = 0.7 * rf_importance + 0.3 * np.ones_like(rf_importance)
+        
+        # Fit selector with weighted features
+        X_train_weighted = X_train * combined_importance
+        l2_selector.fit(X_train_weighted, y_train)
+        
+        # Transform features
+        X_train_selected = l2_selector.transform(X_train)
+        X_val_selected = l2_selector.transform(X_val)
+        
+        # Initialize grid search with cross-validation
+        grid_search = GridSearchCV(
+            base_model, 
+            param_grid, 
+            cv=cv,
+            scoring=revenue_scorer,
+            verbose=1,
+            n_jobs=1
         )
         
-        # Fit selector and transform features
-        X_transformed_selected = selector.fit_transform(X_transformed, y)
+        # Run grid search
+        grid_search.fit(X_train_selected, y_train)
         
-        # Fit the model
-        grid_search.fit(X_transformed_selected, y)
+        # Get best model and parameters
+        best_model = grid_search.best_estimator_
+        best_params = grid_search.best_params_
+        best_score = grid_search.best_score_
+        
+        # Evaluate on validation set
+        val_score = revenue_scorer(best_model, X_val_selected, y_val)
         
         # Save models and transformers
-        self.model = grid_search.best_estimator_
-        self.selector_ = selector
+        self.model = best_model
+        self.selector_ = l2_selector
+        self.preprocessor_ = preprocessor
+        self.rf_selector_ = rf_selector
         
-        # Get feature names after selection
-        selected_features = np.array(feature_names)[selector.get_support()]
+        # Get selected features
+        selected_features = np.array(feature_names)[l2_selector.get_support()]
         
-        # Calculate feature importance
+        # Calculate feature importance with combined approach
+        coef = np.abs(self.model.coef_[0])
+        l2_penalty = np.mean(coef ** 2)
+        rf_importance_selected = rf_importance[l2_selector.get_support()]
+        
+        # Combine feature importance scores
         self.feature_importance_ = dict(zip(
             selected_features,
-            np.abs(self.model.coef_[0])
+            0.7 * (coef / (1 + l2_penalty)) + 0.3 * rf_importance_selected
         ))
         
-        print(f"Best parameters: {grid_search.best_params_}")
+        print(f"Best parameters: {best_params}")
+        print(f"Best cross-validation score: {best_score:.4f}")
+        print(f"Validation score: {val_score:.4f}")
+        print(f"L2 penalty: {l2_penalty:.4f}")
         print(f"\nNumber of features selected: {len(selected_features)}")
         print("\nTop 10 most important features:")
         for feature, importance in sorted(
