@@ -69,14 +69,18 @@ class MyRecommender:
     with their own recommendation algorithm.
     """
     
-    def __init__(self, seed=None):
+    def __init__(self, seed=None, n=2, smoothing=0.5):
         """
         Initialize recommender.
         
         Args:
             seed: Random seed for reproducibility
+            n: Order of the n-gram model (how many previous items to consider)
+            smoothing: Additive smoothing parameter (Laplace smoothing)
         """
         self.seed = seed
+        self.n = n  # Reduced from 3 to 2 to capture more patterns
+        self.smoothing = smoothing  # Increased from 0.1 to 0.5 for better generalization
         self.model = None
         self.categorical_cols_ = None
         self.numeric_cols_ = None
@@ -86,10 +90,25 @@ class MyRecommender:
         self.user_encoders_ = {}
         self.item_encoders_ = {}
         
+        # AR model components
+        self.ngram_counts = defaultdict(lambda: defaultdict(float))
+        self.item_counts = defaultdict(float)
+        self.total_items = 0
+        self.category_counts = defaultdict(lambda: defaultdict(float))  # Added category-based counts
+        self.user_category_preferences = defaultdict(lambda: defaultdict(float))  # Added user-category preferences
+        
         # Set random seed for reproducibility
         if seed is not None:
             np.random.seed(seed)
             random.seed(seed)
+
+    def _get_ngram_key(self, sequence):
+        """Convert a sequence of items to a tuple key for the n-gram dictionary."""
+        # Filter out None values and ensure we have a valid sequence
+        valid_sequence = [x for x in sequence if x is not None]
+        if len(valid_sequence) == 0:
+            return tuple([None] * self.n)
+        return tuple(valid_sequence[-self.n:])
 
     def _create_interaction_features(self, feature_df):
         """Create enhanced interaction features between user and item attributes."""
@@ -222,72 +241,96 @@ class MyRecommender:
 
     def _create_aggregate_features(self, log_df, user_features, item_features):
         """Create aggregate features from historical interactions."""
+        # Convert to pandas if it's a Spark DataFrame
+        if hasattr(log_df, 'toPandas'):
+            log_df = log_df.toPandas()
+        if hasattr(user_features, 'toPandas'):
+            user_features = user_features.toPandas()
+        if hasattr(item_features, 'toPandas'):
+            item_features = item_features.toPandas()
+        
         # User interaction counts and statistics
-        user_stats = log_df.groupBy("user_idx").agg(
-            sf.count("*").alias("user_interaction_count"),
-            sf.avg("relevance").alias("user_avg_relevance"),
-            sf.stddev("relevance").alias("user_relevance_std"),
-            sf.max("relevance").alias("user_max_relevance")
-        )
+        user_stats = log_df.groupby("user_idx").agg({
+            'relevance': ['count', 'mean', 'std', 'max']
+        }).reset_index()
+        user_stats.columns = ['user_idx', 'user_interaction_count', 'user_avg_relevance', 'user_relevance_std', 'user_max_relevance']
         
         # Item popularity and statistics
-        item_stats = log_df.groupBy("item_idx").agg(
-            sf.count("*").alias("item_popularity"),
-            sf.avg("relevance").alias("item_avg_relevance"),
-            sf.stddev("relevance").alias("item_relevance_std"),
-            sf.max("relevance").alias("item_max_relevance")
-        )
+        item_stats = log_df.groupby("item_idx").agg({
+            'relevance': ['count', 'mean', 'std', 'max']
+        }).reset_index()
+        item_stats.columns = ['item_idx', 'item_popularity', 'item_avg_relevance', 'item_relevance_std', 'item_max_relevance']
         
         # Category-level statistics
         if 'category' in item_features.columns:
-            category_stats = log_df.join(
-                item_features.select("item_idx", "category"),
-                on="item_idx"
-            ).groupBy("category").agg(
-                sf.avg("relevance").alias("category_avg_relevance"),
-                sf.count("*").alias("category_popularity")
-            )
+            category_stats = log_df.merge(
+                item_features[['item_idx', 'category']],
+                on='item_idx'
+            ).groupby('category').agg({
+                'relevance': ['mean', 'count']
+            }).reset_index()
+            category_stats.columns = ['category', 'category_avg_relevance', 'category_popularity']
             
             # Join category stats back to items
-            item_features = item_features.join(
+            item_features = item_features.merge(
                 category_stats,
-                on="category",
-                how="left"
+                on='category',
+                how='left'
             )
         
         return user_stats, item_stats
-    
+
     def fit(self, log, user_features=None, item_features=None):
         """Train the recommender model with enhanced features and preprocessing."""
+        # Convert to pandas if it's a Spark DataFrame
+        if hasattr(log, 'toPandas'):
+            log = log.toPandas()
+        if hasattr(user_features, 'toPandas'):
+            user_features = user_features.toPandas()
+        if hasattr(item_features, 'toPandas'):
+            item_features = item_features.toPandas()
+        
+        # Build n-gram counts and category preferences
+        user_sequences = log.groupby('user_idx')
+        for user_idx, user_log in user_sequences:
+            items = user_log['item_idx'].tolist()
+            categories = user_log['category'].tolist() if 'category' in user_log.columns else []
+            
+            # Update category preferences
+            for item, category in zip(items, categories):
+                self.user_category_preferences[user_idx][category] += 1
+                self.category_counts[category][item] += 1
+            
+            # Skip users with too few interactions
+            if len(items) <= self.n:
+                continue
+            
+            # Count n-grams and next items
+            for i in range(len(items) - self.n):
+                context = items[i:i+self.n]
+                next_item = items[i+self.n]
+                
+                # Update counts
+                self.ngram_counts[self._get_ngram_key(context)][next_item] += 1
+                self.item_counts[next_item] += 1
+                self.total_items += 1
+        
         # Create aggregate features
         user_stats, item_stats = self._create_aggregate_features(log, user_features, item_features)
         
         # Join features with user and item data
-        user_features = user_features.join(user_stats, on="user_idx", how="left")
-        item_features = item_features.join(item_stats, on="item_idx", how="left")
+        user_features = user_features.merge(user_stats, on="user_idx", how="left")
+        item_features = item_features.merge(item_stats, on="item_idx", how="left")
         
         # Add prefixes to features
-        user_features = user_features.select(
-            [sf.col("user_idx")] +
-            [sf.col(c).alias(f"u_{c}") for c in user_features.columns if c != "user_idx"]
-        )
-        item_features = item_features.select(
-            [sf.col("item_idx")] +
-            [sf.col(c).alias(f"i_{c}") for c in item_features.columns if c != "item_idx"]
-        )
+        user_features = user_features.rename(columns={c: f"u_{c}" for c in user_features.columns if c != "user_idx"})
+        item_features = item_features.rename(columns={c: f"i_{c}" for c in item_features.columns if c != "item_idx"})
         
         # Join all data
-        joined = (
-            log.alias("l")
-               .join(user_features.alias("u"), on="user_idx", how="inner")
-               .join(item_features.alias("i"), on="item_idx", how="inner")
-        )
-        
-        # Convert to pandas
-        joined_pd = joined.toPandas()
+        joined = log.merge(user_features, on="user_idx", how="inner").merge(item_features, on="item_idx", how="inner")
         
         # Create interaction features
-        feature_df = joined_pd.copy()  # Keep all columns including IDs
+        feature_df = joined.copy()  # Keep all columns including IDs
         feature_df = self._create_interaction_features(feature_df)
         
         # Split columns by dtype
@@ -337,7 +380,7 @@ class MyRecommender:
         X_transformed = preprocessor.fit_transform(feature_df)
         
         # Convert relevance to binary (0 or 1)
-        y = (joined_pd["relevance"] > 0).astype(int)
+        y = (joined["relevance"] > 0).astype(int)
         
         # Enhanced parameter grid for Elastic Net
         param_grid = {
@@ -415,89 +458,102 @@ class MyRecommender:
             reverse=True
         )[:10]:
             print(f"{feature}: {importance:.4f}")
-    
+
     def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
         """Generate recommendations with enhanced features."""
-        # Create aggregate features
-        user_stats, item_stats = self._create_aggregate_features(log, user_features, item_features)
+        # Convert to pandas if they're Spark DataFrames
+        if hasattr(log, 'toPandas'):
+            log = log.toPandas()
+        if hasattr(users, 'toPandas'):
+            users = users.toPandas()
+        if hasattr(items, 'toPandas'):
+            items = items.toPandas()
+        if hasattr(user_features, 'toPandas'):
+            user_features = user_features.toPandas()
+        if hasattr(item_features, 'toPandas'):
+            item_features = item_features.toPandas()
         
-        # Join features
-        user_features = user_features.join(user_stats, on="user_idx", how="left")
-        item_features = item_features.join(item_stats, on="item_idx", how="left")
+        # Get user sequences for AR model
+        user_sequences = log.groupby('user_idx')
         
-        # Add prefixes
-        user_features = user_features.select(
-            [sf.col("user_idx")] +
-            [sf.col(c).alias(f"u_{c}") for c in user_features.columns if c != "user_idx"]
-        )
-        item_features = item_features.select(
-            [sf.col("item_idx")] +
-            [sf.col(c).alias(f"i_{c}") for c in item_features.columns if c != "item_idx"]
-        )
+        # Prepare results
+        recommendations = []
         
-        # Create recommendations
-        recs = users.crossJoin(items)
-        
-        if filter_seen_items and log is not None:
-            seen = log.select("user_idx", "item_idx")
-            recs = recs.join(seen, on=["user_idx", "item_idx"], how="left_anti")
-        
-        recs = (
-            recs.alias("r")
-                .join(user_features.alias("u"), on="user_idx", how="inner")
-                .join(item_features.alias("i"), on="item_idx", how="inner")
-        )
-        
-        # Convert to pandas
-        recs_pd = recs.toPandas()
-        ids = recs_pd[["user_idx", "item_idx"]].copy()
-        
-        # Create interaction features
-        feature_df = recs_pd.reindex(columns=self.input_columns_)
-        feature_df = self._create_interaction_features(feature_df)
-        
-        # Handle missing values and types
-        for col in self.categorical_cols_:
-            if col in feature_df.columns:
-                feature_df[col] = feature_df[col].astype(str)
-                feature_df[col] = feature_df[col].fillna('missing')
-            
-        for col in self.numeric_cols_:
-            if col in feature_df.columns:
-                feature_df[col] = pd.to_numeric(feature_df[col], errors='coerce').fillna(0)
-        
-        # Ensure all required columns are present
-        required_columns = set(self.categorical_cols_ + self.numeric_cols_)
-        missing_columns = required_columns - set(feature_df.columns)
-        for col in missing_columns:
-            if col in self.categorical_cols_:
-                feature_df[col] = 'missing'
+        # Generate recommendations for each user
+        for user_idx in users['user_idx'].unique():
+            # Get user's interaction history
+            if user_idx in user_sequences.groups:
+                user_log = user_sequences.get_group(user_idx)
+                items_sequence = user_log['item_idx'].tolist()
+                categories_sequence = user_log['category'].tolist() if 'category' in user_log.columns else []
             else:
-                feature_df[col] = 0
+                items_sequence = []
+                categories_sequence = []
+            
+            # Get candidate items
+            candidate_items = items['item_idx'].tolist()
+            if filter_seen_items and items_sequence:
+                candidate_items = [item for item in candidate_items if item not in items_sequence]
+            
+            # Calculate scores for each candidate item
+            item_scores = []
+            for item in candidate_items:
+                # Get AR model probability
+                if len(items_sequence) >= self.n:
+                    context = items_sequence[-self.n:]
+                else:
+                    context = [None] * (self.n - len(items_sequence)) + items_sequence
+                
+                context_key = self._get_ngram_key(context)
+                
+                # Calculate base probability from n-gram model
+                if context_key in self.ngram_counts:
+                    context_count = sum(self.ngram_counts[context_key].values())
+                    next_item_count = self.ngram_counts[context_key].get(item, 0)
+                    ar_prob = (next_item_count + self.smoothing) / (context_count + self.smoothing * len(candidate_items))
+                else:
+                    item_count = self.item_counts.get(item, 0)
+                    ar_prob = (item_count + self.smoothing) / (self.total_items + self.smoothing * len(candidate_items))
+                
+                # Get item category and price
+                item_category = items[items['item_idx'] == item]['category'].iloc[0] if 'category' in items.columns else None
+                item_price = items[items['item_idx'] == item]['price'].iloc[0] if 'price' in items.columns else 1.0
+                
+                # Calculate category preference score
+                if item_category and user_idx in self.user_category_preferences:
+                    category_pref = self.user_category_preferences[user_idx].get(item_category, 0)
+                    category_total = sum(self.user_category_preferences[user_idx].values())
+                    category_score = (category_pref + self.smoothing) / (category_total + self.smoothing * len(self.user_category_preferences[user_idx]))
+                else:
+                    category_score = 0.5  # Neutral score if no category information
+                
+                # Combine scores with weights
+                final_score = 0.7 * ar_prob + 0.3 * category_score
+                
+                # Calculate expected revenue with category preference
+                expected_revenue = final_score * item_price
+                item_scores.append((item, expected_revenue))
+            
+            # Sort by expected revenue and take top k
+            item_scores.sort(key=lambda x: x[1], reverse=True)
+            top_k_items = item_scores[:k]
+            
+            # Add to recommendations
+            for rank, (item, score) in enumerate(top_k_items, 1):
+                recommendations.append({
+                    'user_idx': user_idx,
+                    'item_idx': item,
+                    'relevance': score,
+                    'rank': rank
+                })
         
-        # Transform and predict
-        X_rec = self.preprocessor_.transform(feature_df)
-        X_rec_selected = self.selector_.transform(X_rec)
-        preds = self.model.predict_proba(X_rec_selected)[:, 1]
+        # Convert to DataFrame
+        recommendations_df = pd.DataFrame(recommendations)
         
-        # Create final recommendations
-        scored = ids.copy()
-        scored["relevance"] = preds
+        # Convert back to Spark DataFrame
+        recommendations_spark = spark.createDataFrame(recommendations_df)
         
-        scored_spark = (
-            spark.createDataFrame(scored)
-                 .withColumn("relevance", sf.col("relevance"))
-        )
-        
-        window = Window.partitionBy("user_idx").orderBy(sf.desc("relevance"))
-        ranked = (
-            scored_spark
-            .withColumn("rank", sf.row_number().over(window))
-            .filter(sf.col("rank") <= k)
-            .drop("rank")
-        )
-        
-        return ranked
+        return recommendations_spark
 
 
 # Cell: Data Exploration Functions
@@ -808,7 +864,7 @@ def run_recommender_analysis():
         RandomRecommender(seed=42),
         PopularityRecommender(alpha=1.0, seed=42),
         ContentBasedRecommender(similarity_threshold=0.0, seed=42),
-        MyRecommender(seed=42)  # Add your custom recommender here
+        MyRecommender(seed=42),  # Add your custom recommender here
     ]
     recommender_names = ["SVM", "Random", "Popularity", "ContentBased", "MyRecommender"]
     
