@@ -470,7 +470,7 @@ class CompetitionSimulator:
         log_update = log_update.select(
             "user_idx", 
             "item_idx", 
-            sf.col("relevance").cast("long").alias("relevance")
+            sf.col("relevance").cast("int").alias("relevance")
         )
         
         # Add a placeholder for the __iter column that will be treated specially by update_log
