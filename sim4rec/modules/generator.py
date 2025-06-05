@@ -9,7 +9,26 @@ import torch
 import pyspark.sql.types as st
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as sf
-from sdv.tabular import CopulaGAN, CTGAN, GaussianCopula, TVAE
+#from sdv.tabular import CopulaGAN, CTGAN, GaussianCopula, TVAE
+try:
+    # SDV 0.x  (Python ≤ 3.10)
+    from sdv.tabular import CopulaGAN, CTGAN, GaussianCopula, TVAE
+except ModuleNotFoundError:
+    try:
+        # SDV 1.x  (Python ≥ 3.8)
+        from sdv.single_table import (              # noqa: F401
+            CopulaGANSynthesizer as CopulaGAN,
+            CTGANSynthesizer   as CTGAN,
+            GaussianCopulaSynthesizer as GaussianCopula,
+            TVAESynthesizer    as TVAE
+        )
+    except ModuleNotFoundError as err:
+        raise ImportError(
+            "Could not locate the SDV single-table synthesizer classes. "
+            "You either have a very old or very new SDV build that this "
+            "compatibility shim does not yet know.  Installed SDV version: "
+            f"{getattr(__import__('sdv'), '__version__', 'unknown')}"
+        ) from err
 
 from sim4rec.utils.session_handler import State
 from sim4rec.params import (

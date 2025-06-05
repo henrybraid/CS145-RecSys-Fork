@@ -1,3 +1,5 @@
+from .evaluation import EvaluateMetrics
+
 from .generator import (
     GeneratorBase,
     RealDataGenerator,
