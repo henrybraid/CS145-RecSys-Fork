@@ -14,6 +14,23 @@ This notebook performs an exploratory analysis of recommender systems using the 
 We'll generate synthetic data, compare multiple baseline recommenders, and visualize their performance.
 """
 
+import os
+import sys
+os.environ['SPARK_HOME'] = "C:/spark"
+os.environ['HADOOP_HOME'] = r"C:/spark"
+os.environ['PYSPARK_DRIVER_PYTHON'] = 'jupyter'
+os.environ['PYSPARK_DRIVER_PYTHON_OPTS'] = 'lab'
+os.environ['PYSPARK_PYTHON'] = 'python'
+os.environ['JAVA_HOME'] = r"C:/Program Files/Eclipse Adoptium/jdk-17.0.11"
+os.environ['PYSPARK_PYTHON'] = sys.executable
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict
+import shutil
+import subprocess
+
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as sf
 from pyspark.sql import DataFrame, Window
@@ -26,11 +43,33 @@ plt.style.use('seaborn-v0_8-whitegrid')
 sns.set_style('whitegrid')
 plt.rcParams['figure.figsize'] = (14, 8)
 
+# ---------------------------------
+if 'JAVA_HOME' in os.environ:
+    del os.environ['JAVA_HOME']
+
+os.environ['SPARK_HOME'] = "C:/spark/spark-3.5.6-bin-hadoop3"
+os.environ['HADOOP_HOME'] = os.environ['SPARK_HOME']
+os.environ['PYSPARK_PYTHON'] = sys.executable
+os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
+os.environ["spark_python"] = os.getenv('SPARK_HOME') + "\\python"
+os.environ["py4j"] = os.getenv('SPARK_HOME') + "\\python\lib\py4j-0.10.9.7-src.zip"
+
+spark_bin = os.path.join(os.environ['SPARK_HOME'], 'bin')
+if spark_bin not in os.environ['PATH']:
+    os.environ['PATH'] = f"{spark_bin};{os.environ['PATH']}"
+
+spark_python_path = os.environ["spark_python"]
+py4j_zip_path = os.environ["py4j"]
+for path in [spark_python_path, py4j_zip_path]:
+    if path not in sys.path:
+        sys.path.append(path)
+# ---------------------------------
+
 # Initialize Spark session
 spark = SparkSession.builder \
     .appName("RecSysVisualization") \
     .master("local[*]") \
-    .config("spark.driver.memory", "4g") \
+    .config("spark.driver.memory", "14g") \
     .config("spark.sql.shuffle.partitions", "8") \
     .getOrCreate()
 
@@ -38,17 +77,268 @@ spark = SparkSession.builder \
 spark.sparkContext.setLogLevel("WARN")
 
 # Import competition modules
+import sdv
 from data_generator import CompetitionDataGenerator
 from simulator import CompetitionSimulator
 from sample_recommenders import (
     RandomRecommender,
     PopularityRecommender,
-    ContentBasedRecommender, 
+    #ContentBasedRecommender, 
     SVMRecommender, 
 )
 from config import DEFAULT_CONFIG, EVALUATION_METRICS
 
 # Cell: Define custom recommender template
+
+import numpy as np
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder
+from sklearn.neighbors import NearestNeighbors
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+import pandas as pd
+import random
+from sklearn.model_selection import GridSearchCV
+from sklearn.neighbors import KNeighborsRegressor
+
+from pyspark.sql import functions as sf
+from pyspark.sql.types import IntegerType, StructType, StructField
+
+class kNearestRecommender:
+    """
+    k Nearest Neighbors recommender system.
+    Recommends items based on kNN classifier.
+    """
+    
+    def __init__(self, metric='euclidean', k_range=range(3, 25), seed=None):
+        """
+        Initialize recommender.
+        
+        Args:
+            seed: Random seed for reproducibility
+            metric: Chosen distance metric for determining neighbors {"euclidean", "manhattan", "cosine", "minkowski"}
+            k_range: Range of k values to test
+        """
+        self.seed = seed
+        self.metric = metric
+        self.k_range = k_range
+        self.feature_cols = None
+        self.categorical_cols = []
+        self.numerical_cols = []
+        self.best_k = None
+        self.best_metric = None
+        self.preprocess = None
+        self.model = None
+        self.spark = None
+
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+
+    def process_cols(self, data):
+        self.feature_cols = data.columns.tolist()
+
+        nonfeature_cols = ["user_idx", "relevance"]
+
+        self.feature_cols = [col for col in data.columns if col not in nonfeature_cols]
+
+        for col in data[self.feature_cols].columns:
+            if data[col].dtype in ['object', 'bool', 'category']:
+                self.categorical_cols.append(col)
+            else:
+                self.numerical_cols.append(col) 
+
+        return data
+    
+    def create_pipeline(self):
+        transformers = []
+
+        if self.numerical_cols:
+            numerical_transformer = Pipeline(
+                steps=[
+                    ('scaler', StandardScaler())
+                ]
+            )
+            transformers.append(('num', numerical_transformer, self.numerical_cols))
+        
+        if self.categorical_cols:
+            categorical_transformer = Pipeline(
+                steps=[
+                    ('onehot', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'))
+                ]
+            )
+            transformers.append(('cat', categorical_transformer, self.categorical_cols))
+        
+        if transformers:
+            self.preprocess = ColumnTransformer(transformers=transformers)
+        else:
+            self.preprocess = None
+
+    def select_k(self, X, y):
+        knn = KNeighborsRegressor(metric=self.metric, weights="distance")
+        pipe = Pipeline([("prep", self.preprocess), ("knn", knn)])
+        param_grid = {"knn__n_neighbors": list(self.k_range)}
+        gs = GridSearchCV(pipe,
+                        param_grid=param_grid,
+                        scoring="neg_root_mean_squared_error",
+                        cv=3,
+                        n_jobs=-1)
+        gs.fit(X, y)
+
+        self.best_k = gs.best_params_["knn__n_neighbors"]
+        self.model = gs.best_estimator_
+        self.train_x = X
+        self.train_y = y
+    
+    def fit(self, log, user_features=None, item_features=None):
+        """
+        Train the recommender model based on interaction history.
+        """
+        self.spark = log.sparkSession
+        
+        # Convert to pandas
+        log_pd = log.toPandas()
+        if user_features is not None:
+            user_pd = user_features.toPandas()
+        else:
+            user_pd = pd.DataFrame(columns=["user_idx"])
+        if item_features is not None:
+            item_pd = item_features.toPandas()
+        else:
+            item_pd = pd.DataFrame(columns=["item_idx"])
+        
+        # Merge data
+        data = log_pd.merge(user_pd, on='user_idx', how='left').merge(item_pd, on='item_idx', how='left')
+
+        data = self.process_cols(data)
+
+        self.create_pipeline()
+        X = data[self.feature_cols]
+        y = data['relevance'].astype(np.int32)
+
+        # Select best k
+        self.select_k(X, y)
+
+        # Fit and transform the preprocessing pipeline
+        if self.preprocess:
+            X_transformed = self.preprocess.fit_transform(X)
+        else:
+            X_transformed = X.values
+
+        # Fit the model with transformed data
+        self.model = NearestNeighbors(n_neighbors=self.best_k,
+                                    metric=self.metric,
+                                    n_jobs=-1)
+        
+        self.model.fit(X_transformed)
+        self.train_x = X_transformed
+        self.train_y = y
+    
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        """
+        Generate recommendations for users.
+        
+        Args:
+            log: Interaction log with user_idx, item_idx, and relevance columns
+            k: Number of items to recommend
+            users: User dataframe
+            items: Item dataframe
+            user_features: User features dataframe (optional)
+            item_features: Item features dataframe (optional)
+            filter_seen_items: Whether to filter already seen items
+        
+        Returns:
+            DataFrame: Recommendations with user_idx, item_idx, and relevance columns
+        """
+        users_pd = users.toPandas()
+        items_pd = items.toPandas()
+        
+        if user_features is not None:
+            user_feat_pd = user_features.toPandas()
+        else:
+            user_feat_pd = pd.DataFrame({'user_idx': users_pd['user_idx']})
+            
+        if item_features is not None:
+            item_feat_pd = item_features.toPandas()
+        else:
+            item_feat_pd = pd.DataFrame({'item_idx': items_pd['item_idx']})
+        
+        # Create all user-item pairs
+        user_item_pairs = pd.DataFrame(
+            [(user, item) for user in users_pd['user_idx'] for item in items_pd['item_idx']],
+            columns=['user_idx', 'item_idx']
+        )
+        
+        X_test_data = user_item_pairs.merge(user_feat_pd, on='user_idx', how='left').merge(item_feat_pd, on='item_idx', how='left')
+        
+        for col in self.feature_cols:
+            if col not in X_test_data.columns:
+                if col in self.categorical_cols:
+                    X_test_data[col] = 'unknown'
+                else:
+                    X_test_data[col] = 0
+
+        # Add missing columns with default values to match training features
+        for col in self.feature_cols:
+            if col not in X_test_data.columns:
+                X_test_data[col] = 0
+        
+        for col in self.numerical_cols:
+            if col in X_test_data.columns:
+                X_test_data[col] = pd.to_numeric(X_test_data[col], errors='coerce').fillna(0)
+        
+        # Ensure we only use the same features as training
+        X_test_features = X_test_data[self.feature_cols]
+        
+        # Transform the test data
+        if self.preprocess:
+            X_test = self.preprocess.transform(X_test_features)
+        else:
+            X_test = X_test_features.values
+        
+        # Get nearest neighbors
+        distances, indices = self.model.kneighbors(X_test)
+        
+        # Calculate weighted relevance
+        train_y_array = self.train_y.values if hasattr(self.train_y, 'values') else self.train_y
+        
+        weights = 1 / (distances + 1e-10)
+        neighbor_relevances = train_y_array[indices]
+        weighted_relevance = np.sum(weights * neighbor_relevances, axis=1) / np.sum(weights, axis=1)
+        
+        # Create recommendations dataframe
+        recommendations = X_test_data[['user_idx', 'item_idx']].copy()
+        recommendations['relevance'] = np.round(weighted_relevance).astype(np.int32)
+        
+        # Filter seen items if requested
+        if filter_seen_items and log is not None:
+            log_pd = log.toPandas() if hasattr(log, 'toPandas') else log
+            seen_items = set(zip(log_pd['user_idx'], log_pd['item_idx']))
+            recommendations = recommendations[~recommendations.apply(lambda x: (x['user_idx'], x['item_idx']) in seen_items, axis=1)]
+        
+        # Get top k recommendations per user
+        recommendations = (recommendations
+                        .sort_values(['user_idx', 'relevance'], ascending=[True, False])
+                        .groupby('user_idx')
+                        .head(k)
+                        .reset_index(drop=True))
+        
+        # Ensure correct data types
+        recommendations['user_idx'] = recommendations['user_idx'].astype(int)
+        recommendations['item_idx'] = recommendations['item_idx'].astype(int)
+        recommendations['relevance'] = recommendations['relevance'].astype(int)
+        
+        # Convert back to Spark DataFrame
+        schema = StructType([
+            StructField("user_idx", IntegerType(), True),
+            StructField("item_idx", IntegerType(), True),
+            StructField("relevance", IntegerType(), True)
+        ])
+        
+        spark_df = self.spark.createDataFrame(recommendations, schema)
+        
+        return spark_df
+
+
 """
 ## MyRecommender Template
 Below is a template class for implementing a custom recommender system.
@@ -449,10 +739,11 @@ def run_recommender_analysis():
         SVMRecommender(seed=42), 
         RandomRecommender(seed=42),
         PopularityRecommender(alpha=1.0, seed=42),
-        ContentBasedRecommender(similarity_threshold=0.0, seed=42),
-        MyRecommender(seed=42)  # Add your custom recommender here
+        #ContentBasedRecommender(similarity_threshold=0.0, seed=42),
+        kNearestRecommender(seed=42)  # Add your custom recommender here
     ]
-    recommender_names = ["SVM", "Random", "Popularity", "ContentBased", "MyRecommender"]
+    recommender_names = ["SVM", "Random", "Popularity", #"ContentBased", 
+                         "kNearestRecommender"]
     
     # Initialize recommenders with initial history
     for recommender in recommenders:
