@@ -9,6 +9,12 @@ from pyspark.ml import Transformer, PipelineModel
 from sim4rec.utils.session_handler import State
 from sim4rec.modules.generator import GeneratorBase
 
+##
+
+from pyspark.ml.param.shared import HasOutputCol, HasInputCol
+from pyspark.sql import Window
+
+##
 
 # pylint: disable=too-many-instance-attributes
 class Simulator(ABC):

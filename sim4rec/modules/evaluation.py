@@ -15,8 +15,49 @@ from pyspark.ml.evaluation import (
     MulticlassClassificationEvaluator
 )
 
-from sdv.evaluation import evaluate
+#from sdv.evaluation import evaluate
+#from sdmetrics.single_table import evaluate 
+def _locate_evaluate():
+    # 1. SDV 0.21 bundle  • sdmetrics 0.4
+    try:
+        from sdv.evaluation import evaluate          # noqa: F401
+        return evaluate
+    except Exception:
+        pass
 
+    # 2. sdmetrics 0.11
+    try:
+        from sdmetrics.single_table import evaluate  # noqa: F401
+        return evaluate
+    except Exception:
+        pass
+
+    # 3. sdmetrics 0.12–0.13
+    try:
+        from sdmetrics.single_table import evaluate_quality  # noqa: F401
+        return evaluate_quality
+    except Exception:
+        pass
+
+    # 4. sdmetrics ≥ 0.14 – build our own thin wrapper
+    try:
+        from sdmetrics.reports.single_table import QualityReport
+        def _evaluate(synth_df, real_df):
+            report = QualityReport()
+            report.generate(real_data=real_df.toPandas(),
+                            synthetic_data=synth_df.toPandas())
+            # return a flat dict {metric_name: score}
+            scores = report.get_details()
+            return {row['Metric']: row['Score'] for _, row in scores.iterrows()}
+        return _evaluate
+    except Exception:
+        pass
+
+    raise ImportError("Could not locate a compatible 'evaluate' "
+                      "function in the installed sdmetrics version.")
+
+# finally expose it
+evaluate = _locate_evaluate()
 
 def evaluate_synthetic(
     synth_df : DataFrame,
