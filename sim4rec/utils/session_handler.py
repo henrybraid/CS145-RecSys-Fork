@@ -34,7 +34,7 @@ def get_spark_session(
     if shuffle_partitions is None:
         shuffle_partitions = os.cpu_count() * 3
     driver_memory = f"{spark_memory}g"
-    user_home = os.environ["HOME"]
+    user_home = os.environ["USERPROFILE"]
     spark = (
         SparkSession.builder.config("spark.driver.memory", driver_memory)
         .config(
