@@ -21,6 +21,9 @@ from sim4rec.utils import pandas_to_spark
 import xgboost as xgb
 from xgboost import XGBClassifier, callback
 
+import torch
+import torch.nn as nn
+
 """
 ## MyRecommender Template
 Below is a template class for implementing a custom recommender system.
@@ -71,7 +74,6 @@ class GradientBoost:
 
     
     def _setup_df(self, log, user_features = None, item_features = None):
-        
         #add 'u_' prefix to the user features, helps with clarity
         user_features = user_features.select(
             [sf.col('user_idx')] + 
@@ -142,7 +144,7 @@ class GradientBoost:
             cv = 3, 
             scoring = 'neg_mean_squared_error',
             n_jobs = 1)
-        grid_search.fit(X, y,verbose=True)
+        grid_search.fit(X, y,verbose=False)
 
         self.best_params = grid_search.best_params_
 
@@ -165,7 +167,6 @@ class GradientBoost:
         #  4. Store learned parameters for later prediction
         if user_features and item_features:
             pd_log, user_features, item_features = self._setup_df(log, user_features, item_features)
-            
             pd_log = self._create_features(pd_log)
             features = pd_log.drop(columns=['user_idx', 'item_idx', 'relevance'])
 
@@ -191,7 +192,7 @@ class GradientBoost:
                             n_jobs=4)
                 self.model.fit(X_train,y_train, 
                                eval_set = [(X_test, y_test)],
-                               verbose=True)
+                               verbose=False)
     
     def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
         """
@@ -246,4 +247,70 @@ class GradientBoost:
             )
     
         return pandas_to_spark(topk_pd[["user_idx", "item_idx", "relevance"]])
+
+
+class RnnRecommender():
     
+    def __init__(self, seed):
+        self.seed = seed
+
+    def _setup_df(self, log, user_features = None, item_features = None):
+        #add 'u_' prefix to the user features, helps with clarity
+        user_features = user_features.select(
+            [sf.col('user_idx')] + 
+            [sf.col(c).alias(f'u_{c}') for c in user_features.columns if c != 'user_idx']
+        )
+
+        #add 'i_' prefix to the item features, helps with clarity
+        item_features = item_features.select(
+            [sf.col('item_idx')] + 
+            [sf.col(c).alias(f'i_{c}') for c in item_features.columns if c != 'item_idx']
+        )
+
+        pd_log = (
+            log.alias('l')
+                .join(user_features.alias('u'), on='user_idx', how = 'inner')
+                .join(item_features.alias('i'), on='item_idx', how = 'inner')
+                .toPandas()
+        )
+
+        return pd_log, user_features, item_features
+
+    def _build_sequences(self, pd_log):
+        pd_log = pd_log.reset_index(drop=True)
+        pd_log['timestamp'] = pd_log.index
+
+        sequences = {}
+        for user_id, user_df in pd_log.groupby('user_idx'):
+            user_df_sorted = user_df.sort_values('timestamp')
+
+            seq = []
+            for _, row in user_df_sorted.iterrows():
+                seq.append({
+                'timestamp': int(row['timestamp']),
+                'item_idx': int(row['item_idx']),
+                'price': float(row['i_price']),
+                'response': float(row['relevance'])
+            })
+            sequences[int(user_id)] = seq
+
+        return sequences
+
+    def fit(self, log, user_features = None, item_features = None):
+        """
+         Args:
+            log: Interaction log
+            user_features: User features (optional)
+            item_features: Item features (optional)
+        
+        """
+        print(f"Base log: {log.columns}")
+        print(f"User features: {user_features.columns}")
+        print(f"Item features: {item_features.columns}")
+
+        pd_log, user_features, item_features = self._setup_df(log, user_features, item_features)
+        sequences = self._build_sequences(pd_log)
+        print(sequences)
+
+    def predict(self, log, k, users, items, user_features = None, item_features = None, filter_seen_items= True):
+        pass
