@@ -9,6 +9,9 @@ from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.linalg import Vectors, VectorUDT
 from pyspark.sql.types import DoubleType, ArrayType
 
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.getOrCreate()
+
 import sklearn 
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
@@ -255,6 +258,7 @@ class RevenueRNN(nn.Module):
     def __init__(self, input_dim, hidden_dim = 128, num_layers = 1, dropout= 0.0, nonlinearity='tanh'):
         super().__init__()
 
+        self.input_size = input_dim
         self.model = nn.RNN(
             input_size = input_dim,
             hidden_size = hidden_dim,
@@ -314,21 +318,6 @@ class RnnRecommender():
         #get the price of the item compared to the average amount spent by the users
         if 'user_avg_price' in features.columns and 'i_price' in features.columns:
             features['price_vs_user_mean'] = features['i_price'] - features['user_avg_price']
-
-        # User interaction counts and statistics
-        user_stats = features.groupby("user_idx").agg({
-            'relevance': ['count', 'mean', 'std', 'max']
-        }).reset_index()
-        user_stats.columns = ['user_idx', 'user_interaction_count', 'user_avg_relevance', 'user_relevance_std', 'user_max_relevance']
-        
-        # Item popularity and statistics
-        item_stats = features.groupby("item_idx").agg({
-            'relevance': ['count', 'mean', 'std', 'max']
-        }).reset_index()
-        item_stats.columns = ['item_idx', 'item_popularity', 'item_avg_relevance', 'item_relevance_std', 'item_max_relevance']
-        
-        features = features.merge(user_stats, on='user_idx', how='left')
-        features = features.merge(item_stats, on = 'item_idx', how = 'left')
 
         return features
 
@@ -425,37 +414,112 @@ class RnnRecommender():
         pd_log = self._create_features(pd_log)
         features = pd_log.drop(columns=['user_idx', 'item_idx', 'relevance'])
 
+        #Send the features through the data processing pipeline
         features_transformed = self._preprocess_features(features)
 
         X_np = features_transformed.toarray() if hasattr(features_transformed, "toarray") else features_transformed
         y_np = pd_log['relevance'].values
 
+        #Make the data sequential and ordered by row index
         X, y, lengths = self._build_sequences(pd_log, X_np, y_np)
-
-
-        print(f"Feature columns: {list(features.columns)}")
-
-        if self.model is None:
-            self._init_rnn(X.shape[-1])
-
-
+        
+        #Pack data for the RNN
         X_packed = pack_padded_sequence(X, lengths, batch_first=True, enforce_sorted=False)
-        if self.model is not None:
-            self.model.train()
-            self.optimizer.zero_grad()
 
-            # forward
-            preds = self.model(X_packed)  # (batch, seq_len)
-            print(preds)
-            # compute loss only over the valid time-steps
-            # mask out padded positions
-            mask = (torch.arange(preds.size(1))[None, :].to(self.device)
-                    < lengths[:, None])
-            loss = self.criterion(preds[mask], y[mask])
+        current_dim = X.shape[-1]
+        if (self.model is None) or (self.model.input_size != current_dim):
+            self._init_rnn(current_dim)
+        
+        self.model.train()
+        self.optimizer.zero_grad()
 
-            # backward + step
-            loss.backward()
-            self.optimizer.step()
+        # forward
+        preds = self.model(X_packed)  # (batch, seq_len)
+
+        # compute loss only over the valid time-steps
+        # mask out padded positions
+        mask = (torch.arange(preds.size(1))[None, :].to(self.device)< lengths[:, None])
+        loss = self.criterion(preds[mask], y[mask])
+
+        # backward + step
+        loss.backward()
+        self.optimizer.step()
 
     def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
-        pass
+        log = log.toPandas()
+        users = users.toPandas()
+        items = items.toPandas()
+        user_features = user_features.toPandas()
+        item_features = item_features.toPandas()
+        
+        price_map = items.set_index("item_idx")["price"   ].to_dict() if "price"    in items else {}
+        category_map = items.set_index("item_idx")["category"].to_dict() if "category" in items else {}
+
+        # Group past interactions once
+        hist_by_user = log.groupby("user_idx")
+        
+        self.model.eval()
+
+        recommendations = []
+
+        for uid in users['user_idx'].unique():
+            #Build the user's history:
+            if uid in hist_by_user.groups:
+                past = hist_by_user.get_group(uid).copy()
+                past = self._create_features(past)   # adds timestamp & aggregates
+                hist_items = past["item_idx"].tolist()
+            else:
+                past = pd.DataFrame(columns=log.columns)
+                past = self._create_features(past)
+                hist_items = []
+
+            cand_items = items["item_idx"].tolist()
+            if filter_seen_items:
+                cand_items = [it for it in cand_items if it not in hist_items]
+
+            scores = []
+            for it in cand_items:
+                row = {
+                    "user_idx": uid,
+                    "item_idx": it,
+                    **{c: user_features.loc[user_features["user_idx"] == uid, c].iloc[0]
+                    for c in user_features.columns if c != "user_idx"},
+                    **{c: item_features.loc[item_features["item_idx"] == it, c].iloc[0]
+                    for c in item_features.columns if c != "item_idx"},
+                }
+                row["timestamp"] = len(hist_items)
+                next_df = pd.DataFrame([row])
+                next_df = self._create_features(next_df)
+
+                # Transform history + candidate together to ensure equal width
+                seq_df = pd.concat([past, next_df], ignore_index=True)
+                seq_df = seq_df.reindex(columns=self.input_cols)
+                X_seq  = self.pipeline.transform(seq_df)
+
+                X_tensor = torch.tensor(X_seq, dtype=torch.float32, device=self.device).unsqueeze(0)  # (1, T, F)
+
+                # pack exactly as in training
+                lengths = torch.tensor([X_seq.shape[0]], dtype=torch.long)
+                packed  = nn.utils.rnn.pack_padded_sequence(
+                    X_tensor, lengths, batch_first=True, enforce_sorted=False
+                )
+
+                with torch.no_grad():
+                    y_pred_seq = self.model(packed)
+                    score = y_pred_seq[0, -1].item() # last timestep
+
+                #expected revenue
+                price = price_map.get(it, 1.0)
+                expected_rev = score * price
+                scores.append((it, expected_rev))
+            top_k = sorted(scores, key=lambda x: x[1], reverse=True)[:k]
+            for rank, (it, sc) in enumerate(top_k, 1):
+                recommendations.append({
+                    "user_idx": uid,
+                    "item_idx": it,
+                    "relevance": sc,
+                    "rank": rank
+                })
+        rec_pd = pd.DataFrame(recommendations)
+        rec_spark = spark.createDataFrame(rec_pd)
+        return rec_spark
