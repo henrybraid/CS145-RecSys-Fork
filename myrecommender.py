@@ -23,6 +23,8 @@ from xgboost import XGBClassifier, callback
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
+
 
 """
 ## MyRecommender Template
@@ -249,10 +251,87 @@ class GradientBoost:
         return pandas_to_spark(topk_pd[["user_idx", "item_idx", "relevance"]])
 
 
+class RevenueRNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim = 128, num_layers = 1, dropout= 0.0, nonlinearity='tanh'):
+        super().__init__()
+
+        self.model = nn.RNN(
+            input_size = input_dim,
+            hidden_size = hidden_dim,
+            num_layers = num_layers,
+            dropout=dropout if num_layers>1 else 0.0,
+            nonlinearity=nonlinearity,
+            batch_first = True
+        )
+
+        self.out = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x_packed):
+
+        # x_packeed is a PackedSequence of shape (B, L, D)
+        packed_out, _ = self.model(x_packed)
+
+        # unpack back to (B, L, hidden_dim)
+        out, lengths = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
+
+        # apply linear layer at each time-step → (B, L, 1)
+        rev = self.out(out)
+        return rev.squeeze(-1)
+
+
+
 class RnnRecommender():
     
-    def __init__(self, seed):
+    def __init__(self, seed, hidden_dim=128, num_layers=1, dropout=0.0, lr=1e-3):
         self.seed = seed
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.lr = lr
+
+        self.model = None
+        self.optimizer = None
+        self.criterion = None
+
+        self.encoder = OneHotEncoder(handle_unknown='ignore',sparse_output = False)
+        self.scalar = StandardScaler()
+
+    def _create_features(self, features):
+        #Use the row ordering as the timestamping
+        features = features.reset_index(drop=True)
+        features['timestamp'] = features.index
+
+        #average category price
+        if 'i_category' in features.columns and 'i_price' in features.columns:
+            features['avg_category_price'] = features.groupby('i_category')['i_price'].transform('mean')
+        
+        #get the average price spent by user
+        if 'user_idx' in features.columns and 'i_price' in features.columns:
+            features['user_avg_price'] = features.groupby('user_idx')['i_price'].transform('mean')
+
+        #get the price of the item compared to the average amount spent by the users
+        if 'user_avg_price' in features.columns and 'i_price' in features.columns:
+            features['price_vs_user_mean'] = features['i_price'] - features['user_avg_price']
+
+        # User interaction counts and statistics
+        user_stats = features.groupby("user_idx").agg({
+            'relevance': ['count', 'mean', 'std', 'max']
+        }).reset_index()
+        user_stats.columns = ['user_idx', 'user_interaction_count', 'user_avg_relevance', 'user_relevance_std', 'user_max_relevance']
+        
+        # Item popularity and statistics
+        item_stats = features.groupby("item_idx").agg({
+            'relevance': ['count', 'mean', 'std', 'max']
+        }).reset_index()
+        item_stats.columns = ['item_idx', 'item_popularity', 'item_avg_relevance', 'item_relevance_std', 'item_max_relevance']
+        
+        features = features.merge(user_stats, on='user_idx', how='left')
+        features = features.merge(item_stats, on = 'item_idx', how = 'left')
+
+        return features
+
 
     def _setup_df(self, log, user_features = None, item_features = None):
         #add 'u_' prefix to the user features, helps with clarity
@@ -276,25 +355,62 @@ class RnnRecommender():
 
         return pd_log, user_features, item_features
 
-    def _build_sequences(self, pd_log):
-        pd_log = pd_log.reset_index(drop=True)
-        pd_log['timestamp'] = pd_log.index
+    def _preprocess_features(self, features):
+        self.categorical_cols = features.select_dtypes(include=['object', 'category']).columns.tolist()
+        self.numerical_cols = features.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
+        self.input_cols = self.categorical_cols + self.numerical_cols
+        
 
-        sequences = {}
-        for user_id, user_df in pd_log.groupby('user_idx'):
-            user_df_sorted = user_df.sort_values('timestamp')
+        cat_pipeline = Pipeline([
+            ('impute', SimpleImputer(strategy='most_frequent')),
+            ('onehot', self.encoder)
+        ])
 
-            seq = []
-            for _, row in user_df_sorted.iterrows():
-                seq.append({
-                'timestamp': int(row['timestamp']),
-                'item_idx': int(row['item_idx']),
-                'price': float(row['i_price']),
-                'response': float(row['relevance'])
-            })
-            sequences[int(user_id)] = seq
+        num_pipeline = Pipeline([
+            ('impute', SimpleImputer(strategy='mean')),
+            ('scale', self.scalar)
+        ])
 
-        return sequences
+        self.pipeline = ColumnTransformer(
+            transformers = [
+                ('cat', cat_pipeline, self.categorical_cols),
+                ('num', num_pipeline, self.numerical_cols)
+            ]
+        )
+
+        features = features.reindex(columns=self.input_cols)
+        features_transformed = self.pipeline.fit_transform(features)
+
+        return features_transformed
+    
+    def _build_sequences(self, pd_log, X_np, y_np):
+        X_seq, y_seq, lengths = [], [], []
+        
+        for uid, grp in pd_log.groupby('user_idx', sort = False):
+            idx = grp.sort_values('timestamp').index
+            features = torch.tensor(X_np[idx], dtype=torch.float32)
+            targets = torch.tensor(y_np[idx],dtype=torch.float32)
+            X_seq.append(features)
+            y_seq.append(targets)
+            lengths.append(len(idx))
+        
+        X_pad = nn.utils.rnn.pad_sequence(X_seq, batch_first = True)
+        y_pad = nn.utils.rnn.pad_sequence(y_seq, batch_first = True)
+        lengths = torch.tensor(lengths)
+        
+        return X_pad, y_pad, lengths
+        
+
+    def _init_rnn(self, input_dim):
+        self.model = RevenueRNN(
+            input_dim=input_dim, 
+            hidden_dim = self.hidden_dim,
+            num_layers = self.num_layers,
+            dropout = self.dropout
+        ).to(self.device)
+
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr = self.lr)
+        self.criterion = nn.MSELoss()
 
     def fit(self, log, user_features = None, item_features = None):
         """
@@ -304,13 +420,42 @@ class RnnRecommender():
             item_features: Item features (optional)
         
         """
-        print(f"Base log: {log.columns}")
-        print(f"User features: {user_features.columns}")
-        print(f"Item features: {item_features.columns}")
 
         pd_log, user_features, item_features = self._setup_df(log, user_features, item_features)
-        sequences = self._build_sequences(pd_log)
-        print(sequences)
+        pd_log = self._create_features(pd_log)
+        features = pd_log.drop(columns=['user_idx', 'item_idx', 'relevance'])
 
-    def predict(self, log, k, users, items, user_features = None, item_features = None, filter_seen_items= True):
+        features_transformed = self._preprocess_features(features)
+
+        X_np = features_transformed.toarray() if hasattr(features_transformed, "toarray") else features_transformed
+        y_np = pd_log['relevance'].values
+
+        X, y, lengths = self._build_sequences(pd_log, X_np, y_np)
+
+
+        print(f"Feature columns: {list(features.columns)}")
+
+        if self.model is None:
+            self._init_rnn(X.shape[-1])
+
+
+        X_packed = pack_padded_sequence(X, lengths, batch_first=True, enforce_sorted=False)
+        if self.model is not None:
+            self.model.train()
+            self.optimizer.zero_grad()
+
+            # forward
+            preds = self.model(X_packed)  # (batch, seq_len)
+            print(preds)
+            # compute loss only over the valid time-steps
+            # mask out padded positions
+            mask = (torch.arange(preds.size(1))[None, :].to(self.device)
+                    < lengths[:, None])
+            loss = self.criterion(preds[mask], y[mask])
+
+            # backward + step
+            loss.backward()
+            self.optimizer.step()
+
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
         pass
