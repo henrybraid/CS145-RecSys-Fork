@@ -289,7 +289,7 @@ class RevenueRNN(nn.Module):
 
 class RnnRecommender():
     
-    def __init__(self, seed, hidden_dim=128, num_layers=1, dropout=0.0, lr=1e-3):
+    def __init__(self, seed, hidden_dim=128, num_layers=3, dropout=0.0, lr=1e-3):
         self.seed = seed
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -620,34 +620,45 @@ class GCNRecommender:
         return features_transformed
     
     def _get_graph_pieces(self, log, user_features = None, item_features = None):
-        #Get amount of users and items
-        num_users = user_features['user_idx'].nunique()
-        num_items = item_features['item_idx'].nunique()
+        # ---- 1.  Build dense id maps ------------------------------------------
+        user_ids = np.sort(user_features["user_idx"].unique())
+        item_ids = np.sort(item_features["item_idx"].unique())
 
-        user_features = user_features.sort_values('user_idx')
-        item_features = item_features.sort_values('item_idx')
+        uid2nid = {uid: n for n, uid in enumerate(user_ids)}            # 0…U-1
+        iid2nid = {iid: n for n, iid in enumerate(item_ids, start=len(user_ids))}
 
-        # Offset item_idx so item nodes start after user nodes
-        item_offset = num_users
-        log['item_idx'] = log['item_idx'] + item_offset
+        # ---- 2.  Re-order feature frames to match the new ids -----------------
+        user_features = (
+            user_features.copy()
+            .assign(__nid__=lambda df: df["user_idx"].map(uid2nid))
+            .sort_values("__nid__")
+            .drop(columns="__nid__")
+        )
+        item_features = (
+            item_features.copy()
+            .assign(__nid__=lambda df: df["item_idx"].map(iid2nid))
+            .sort_values("__nid__")
+            .drop(columns="__nid__")
+        )
 
-        #build edge index
-        edge_index = torch.tensor([
-            log['user_idx'].values,
-            log['item_idx'].values
-            ], 
-            dtype = torch.long)
-        
-        #temporary, might want to make more complex
-        edge_weight = torch.tensor(log['relevance'].values, dtype = torch.float)
+        # ---- after building uid2nid / iid2nid ----
+        mask = log["user_idx"].isin(uid2nid) & log["item_idx"].isin(iid2nid)
+        if not mask.all():
+            dropped = (~mask).sum()
+        log = log[mask]
 
-        #Preprocess features
-        user_features_transformed = self._preprocess_features(user_features)
-        item_features_transformed = self._preprocess_features(item_features)
+        log_dense_u = log["user_idx"].map(uid2nid).astype(np.int64).values
+        log_dense_i = log["item_idx"].map(iid2nid).astype(np.int64).values
+        edge_index  = torch.tensor([log_dense_u, log_dense_i], dtype=torch.long)
+        edge_weight = torch.tensor(log["relevance"].values, dtype=torch.float32)
 
-        user_tensor = torch.tensor(user_features_transformed, dtype = torch.float)
-        item_tensor = torch.tensor(item_features_transformed, dtype = torch.float)
-        
+        # ---- 4.  Feature preprocessing  ---------------------------------------
+        user_feat_arr = self._preprocess_features(user_features)
+        item_feat_arr = self._preprocess_features(item_features)
+
+        user_tensor = torch.tensor(user_feat_arr, dtype=torch.float32)
+        item_tensor = torch.tensor(item_feat_arr, dtype=torch.float32)
+
         return user_tensor, item_tensor, edge_index, edge_weight
 
 
@@ -659,7 +670,6 @@ class GCNRecommender:
         if hasattr(item_features, "toPandas"):
             item_features = item_features.toPandas()
         user_tensor, item_tensor, edge_index, edge_weight = self._get_graph_pieces(pd_log, user_features, item_features)
-        print(f"Got user pieces")
         #get necessary dimensions
         user_dim = user_tensor.shape[1]
         item_dim = item_tensor.shape[1]
@@ -695,4 +705,74 @@ class GCNRecommender:
         
 
     def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
-        pass
+        # ---- 1. Convert Spark → pandas -----------------------------------------
+        pd_log          = log.toPandas()
+        users_pd        = users.toPandas()
+        items_pd        = items.toPandas()
+        user_feats_pd   = user_features.toPandas()
+        item_feats_pd   = item_features.toPandas()
+
+        price_map = (
+            items_pd.set_index("item_idx")["price"].to_dict()
+            if "price" in items_pd
+            else {}
+        )
+
+        # ---- 2. Build graph and compute embeddings -----------------------------
+        user_tensor, item_tensor, edge_index, edge_weight = self._get_graph_pieces(
+            pd_log, user_feats_pd, item_feats_pd
+        )
+
+        self.model.eval()
+        with torch.no_grad():
+            node_embs = self.model(user_tensor, item_tensor, edge_index, edge_weight)
+
+        # Split back into user/item blocks
+        n_users = user_tensor.shape[0]
+        user_embs = node_embs[:n_users]          # (U, D)
+        item_embs = node_embs[n_users:]          # (I, D)
+
+        # Position look-ups (because rows were sorted by *_idx)
+        user_order = user_feats_pd.sort_values("user_idx")["user_idx"].tolist()
+        item_order = item_feats_pd.sort_values("item_idx")["item_idx"].tolist()
+        u_pos = {u: i for i, u in enumerate(user_order)}
+        i_pos = {i: j for j, i in enumerate(item_order)}
+
+        # ---- 3. Pre-gather past interactions -----------------------------------
+        hist_by_user = pd_log.groupby("user_idx")
+        all_items    = items_pd["item_idx"].tolist()
+
+        recommendations = []
+
+        # ---- 4. Score & rank ----------------------------------------------------
+        for uid in users_pd["user_idx"].unique():
+            past_items = (
+                hist_by_user.get_group(uid)["item_idx"].tolist()
+                if uid in hist_by_user.groups
+                else []
+            )
+            cand_items = (
+                [it for it in all_items if it not in past_items]
+                if filter_seen_items
+                else all_items
+            )
+
+            u_vec = user_embs[u_pos[uid]]                # (D,)
+            scores = []
+            for it in cand_items:
+                if it not in i_pos:        # safety check
+                    continue
+                i_vec = item_embs[i_pos[it]]
+                pred   = torch.dot(u_vec, i_vec).item()   # dot-product relevance
+                rev    = pred * price_map.get(it, 1.0)    # expected revenue
+                scores.append((it, rev))
+
+            top_k = sorted(scores, key=lambda x: x[1], reverse=True)[:k]
+            for rank, (it, sc) in enumerate(top_k, 1):
+                recommendations.append(
+                    {"user_idx": uid, "item_idx": it, "relevance": sc, "rank": rank}
+                )
+
+        rec_pd    = pd.DataFrame(recommendations)
+        rec_spark = spark.createDataFrame(rec_pd)
+        return rec_spark
