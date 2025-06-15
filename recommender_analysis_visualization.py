@@ -199,8 +199,8 @@ class LSTMRecommender:
             log = log.toPandas()
             
         # Sample data
-        if len(log) > 50000:
-            log = log.sample(n=50000, random_state=42)
+        if len(log) > 10000:
+            log = log.sample(n=10000, random_state=42)
         
         # Preprocess features
         user_feat_processed, item_feat_processed = self._preprocess_features(
