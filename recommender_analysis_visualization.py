@@ -199,8 +199,8 @@ class LSTMRecommender:
             log = log.toPandas()
             
         # Sample data
-        if len(log) > 10000:
-            log = log.sample(n=10000, random_state=42)
+        if len(log) > 50000:
+            log = log.sample(n=50000, random_state=42)
         
         # Preprocess features
         user_feat_processed, item_feat_processed = self._preprocess_features(
@@ -882,8 +882,8 @@ def run_recommender_analysis():
         RandomRecommender(seed=42),
         PopularityRecommender(alpha=1.0, seed=42),
         ContentBasedRecommender(similarity_threshold=0.0, seed=42),
-        LSTMRecommender(lstm_units=128, dropout_rate=0.3, 
-                        learning_rate=0.0005, batch_size=64, epochs=50, 
+        LSTMRecommender(lstm_units=128, dropout_rate=0.4, 
+                        learning_rate=0.0001, batch_size=32, epochs=50, 
                         n_features_to_select=15, embedding_dim=32, seed=42)
     ]
     recommender_names = ["SVM", "Random", "Popularity", "ContentBased", "LSTMRecommender"]
