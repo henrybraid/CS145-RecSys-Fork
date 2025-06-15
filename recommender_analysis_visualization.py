@@ -67,10 +67,10 @@ class LSTMRecommender:
     def __init__(self, 
                  lstm_units=128,
                  dropout_rate=0.3,
-                 learning_rate=0.0005,
-                 batch_size=64,
+                 learning_rate=0.0001,
+                 batch_size=32,
                  epochs=50,
-                 n_features_to_select=20,
+                 n_features_to_select=15,
                  embedding_dim=32,
                  seed=None):
         """
