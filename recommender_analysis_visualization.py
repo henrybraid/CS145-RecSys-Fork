@@ -884,7 +884,7 @@ def run_recommender_analysis():
         ContentBasedRecommender(similarity_threshold=0.0, seed=42),
         LSTMRecommender(lstm_units=128, dropout_rate=0.3, 
                         learning_rate=0.0005, batch_size=64, epochs=50, 
-                        n_features_to_select=20, embedding_dim=32, seed=42)
+                        n_features_to_select=15, embedding_dim=32, seed=42)
     ]
     recommender_names = ["SVM", "Random", "Popularity", "ContentBased", "LSTMRecommender"]
     
