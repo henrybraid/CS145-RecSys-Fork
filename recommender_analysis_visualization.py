@@ -46,9 +46,11 @@ from sample_recommenders import (
     ContentBasedRecommender, 
     SVMRecommender, 
 )
-from myrecommender import GradientBoost, RnnRecommender, GCNRecommender
 from config import DEFAULT_CONFIG, EVALUATION_METRICS
 
+from checkpoint1 import GradientBoost, LogRegRecommender, DecisionTreeRecommender
+from checkpoint2 import AutoRegRecommender, RnnRecommender, LSTMRecommender
+from checkpoint3 import GCNRecommender
 # Cell: Data Exploration Functions
 """
 ## Data Exploration Functions
@@ -353,15 +355,29 @@ def run_recommender_analysis():
     
     # Initialize recommenders to compare
     recommenders = [
-        SVMRecommender(seed=42), 
-        RandomRecommender(seed=42),
-        PopularityRecommender(alpha=1.0, seed=42),
-        ContentBasedRecommender(similarity_threshold=0.0, seed=42),
+        #SVMRecommender(seed=42), 
+        #RandomRecommender(seed=42),
+        #PopularityRecommender(alpha=1.0, seed=42),
+        #ContentBasedRecommender(similarity_threshold=0.0, seed=42),
+        LogRegRecommender(seed=42),
+        DecisionTreeRecommender(seed=42),
         GradientBoost(seed=42),  # Add your custom recommender here
+        AutoRegRecommender(seed=42),
         RnnRecommender(seed=42),
+        LSTMRecommender(seed=42),
         GCNRecommender(seed=42)
     ]
-    recommender_names = ["SVM", "Random", "Popularity", "ContentBased", "Gradient Boost","RNN","GCN"]
+    recommender_names = [#"SVM", 
+                         #"Random", 
+                         #"Popularity", 
+                         #"ContentBased", 
+                         "LogReg",
+                         "DecTree",
+                         "GradBoost",
+                         "AutoReg",
+                         "RNN",
+                         "LSTM",
+                         "GCN"]
     
     # Initialize recommenders with initial history
     for recommender in recommenders:
@@ -519,7 +535,19 @@ def visualize_recommender_performance(results_df, recommender_names):
     # Plot revenue trajectories
     plt.subplot(3, 2, 4)
     markers = ['o', 's', 'D', '^']
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+    colors = [
+        '#1f77b4',  # blue
+        '#ff7f0e',  # orange
+        '#2ca02c',  # green
+        '#d62728',  # red
+        '#9467bd',  # purple
+        '#8c564b',  # brown
+        '#e377c2',  # pink
+        '#7f7f7f',  # gray
+        '#bcbd22',  # yellow-green
+        '#17becf',  # teal
+        '#aec7e8'   # light blue
+    ]
     
     for i, name in enumerate(results_df['name']):
         # Combined train and test trajectories
