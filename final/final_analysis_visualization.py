@@ -36,6 +36,7 @@ spark = SparkSession.builder \
 
 # Set log level to warnings only
 spark.sparkContext.setLogLevel("WARN")
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Import competition modules
 from experiments.data_generator import CompetitionDataGenerator
@@ -51,6 +52,7 @@ from experiments.config import DEFAULT_CONFIG, EVALUATION_METRICS
 from checkpoint1 import GradientBoost, LogRegRecommender, DecisionTreeRecommender
 from checkpoint2 import AutoRegRecommender, RnnRecommender, LSTMRecommender
 from checkpoint3 import GCNRecommender
+from final_recommender import FinalRecommender
 # Cell: Data Exploration Functions
 """
 ## Data Exploration Functions
@@ -360,25 +362,13 @@ def run_recommender_analysis():
         RandomRecommender(seed=42),
         PopularityRecommender(alpha=1.0, seed=42),
         ContentBasedRecommender(similarity_threshold=0.0, seed=42),
-        LogRegRecommender(seed=42),
-        DecisionTreeRecommender(seed=42),
-        GradientBoost(seed=42, optimize = True),  
-        AutoRegRecommender(seed=42),
-        RnnRecommender(seed=42),
-        LSTMRecommender(seed=42),
-        GCNRecommender(seed=42)
+        FinalRecommender(seed =42)
     ]
     recommender_names = ["SVM", 
                          "Random", 
                          "Popularity", 
                          "ContentBased", 
-                         "LogReg",
-                         "DecTree",
-                         "GradBoost",
-                         "AutoReg",
-                         "RNN",
-                         "LSTM",
-                         "GCN"]
+                         "Final AR",]
     
     # Initialize recommenders with initial history
     for recommender in recommenders:
