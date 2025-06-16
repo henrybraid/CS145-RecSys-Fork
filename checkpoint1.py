@@ -554,7 +554,7 @@ class GradientBoost:
     with their own recommendation algorithm.
     """
     
-    def __init__(self, seed=None):
+    def __init__(self, seed=None, optimize=True):
         """
         Initialize recommender.
         
@@ -563,6 +563,7 @@ class GradientBoost:
         """
         # Add your initialization logic here
         self.seed = seed
+        self.optimize = optimize
         self.categorical_cols = None
         self.numerical_cols = None
         self.input_cols = None
@@ -639,16 +640,17 @@ class GradientBoost:
         return features_transformed
 
     def _get_best_model(self, X,y):
-        #Best params so far: 31% increase, commented on each side
+        print("Optimized Version")
         param_grid = {
-            "n_estimators": [10, 25, 100], #25
-            "learning_rate": [0.001, 0.01], #0.01
-            "max_depth": [2, 4], #4
-            "min_child_weight": [4, 5, 6], #5
-            'reg_lambda':[1.0], #when using other regularization, performance decreased
-        }
+                "n_estimators": [100, 200], #100
+                "learning_rate": [0.3], #0.3
+                "max_depth": [6, 10], #6
+                "min_child_weight": [1], #1
+            }
+        
+        #Best params so far: 31% increase, commented on each side
+        
         base_model = XGBClassifier(
-                    objective="binary:logistic", 
                     booster='gbtree',
                     random_state = self.seed, 
                     tree_method = 'hist',
@@ -656,8 +658,8 @@ class GradientBoost:
                     n_jobs = 4)
         grid_search = GridSearchCV(
             base_model, param_grid, 
-            cv = 3, 
-            scoring = 'neg_mean_squared_error',
+            cv = 5, 
+            scoring = 'neg_log_loss',
             n_jobs = 1)
         grid_search.fit(X, y,verbose=False)
 
@@ -689,26 +691,30 @@ class GradientBoost:
             y = pd_log['relevance'].values
 
             if self.model is None:
-                #Perform grid search to get the best model on first fit. Then, use this model for the rest of training.
-                self.model = self._get_best_model(X,y)
-                print(f'\nBest parameters: {self.best_params}\n')
-
-            else:
-                #Apply early stopping to the training iterations after determining the best model
-                X_train, X_test, y_train, y_test = train_test_split(X,y, test_size=0.25, random_state=self.seed)
-                
-                self.model = XGBClassifier(
-                            **self.best_params,
-                            random_state=self.seed,
+                if self.optimize:
+                    self.model = self._get_best_model(X,y)
+                    self.model = XGBClassifier(
+                                    **self.best_params,
+                                    random_state=self.seed,
+                                    booster='gbtree',
+                                    tree_method='hist',
+                                    eval_metric='logloss',
+                                    early_stopping_rounds = 5, #Does not even happen, because the 25 estimators is already performing well
+                                    n_jobs=4)
+                else:
+                    self.model = XGBClassifier(
                             booster='gbtree',
-                            tree_method='hist',
+                            random_state = self.seed, 
+                            tree_method = 'hist',
                             eval_metric='logloss',
-                            early_stopping_rounds = 5, #Does not even happen, because the 25 estimators is already performing well
-                            n_jobs=4)
-                self.model.fit(X_train,y_train, 
-                               eval_set = [(X_test, y_test)],
-                               verbose=False)
-    
+                            n_jobs = 4)
+                    
+            X_train, X_test, y_train, y_test = train_test_split(X,y, test_size=0.25, random_state=self.seed)
+                    
+            self.model.fit(X_train,y_train, 
+                        eval_set = [(X_test, y_test)],
+                        verbose=False)
+                    
     def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
         """
         Generate recommendations for users.

@@ -353,31 +353,28 @@ def run_recommender_analysis():
     Now we'll set up and evaluate different recommendation algorithms.
     """
     
+
     # Initialize recommenders to compare
     recommenders = [
         #SVMRecommender(seed=42), 
         #RandomRecommender(seed=42),
         #PopularityRecommender(alpha=1.0, seed=42),
         #ContentBasedRecommender(similarity_threshold=0.0, seed=42),
-        LogRegRecommender(seed=42),
-        DecisionTreeRecommender(seed=42),
-        GradientBoost(seed=42),  # Add your custom recommender here
-        AutoRegRecommender(seed=42),
-        RnnRecommender(seed=42),
-        LSTMRecommender(seed=42),
-        GCNRecommender(seed=42)
+        #LogRegRecommender(seed=42),
+        #DecisionTreeRecommender(seed=42),
+        GradientBoost(seed=42, optimize = True),  # Add your custom recommender here
+        GradientBoost(seed=42, optimize=False)
+        #AutoRegRecommender(seed=42),
+        #RnnRecommender(seed=42),
+        #LSTMRecommender(seed=42),
+        #GCNRecommender(seed=42)
     ]
     recommender_names = [#"SVM", 
                          #"Random", 
                          #"Popularity", 
                          #"ContentBased", 
-                         "LogReg",
-                         "DecTree",
-                         "GradBoost",
-                         "AutoReg",
-                         "RNN",
-                         "LSTM",
-                         "GCN"]
+                         "Optimized GradBoost",
+                         "Non-Optimized GradBoost",]
     
     # Initialize recommenders with initial history
     for recommender in recommenders:
