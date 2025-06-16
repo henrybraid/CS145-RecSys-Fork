@@ -48,7 +48,7 @@ from experiments.sample_recommenders import (
 )
 from experiments.config import DEFAULT_CONFIG, EVALUATION_METRICS
 
-from checkpoint1 import GradientBoost, LogRegRecommender, DecisionTreeRecommender
+from checkpoint1 import GradientBoost, LogRegRecommender, DecisionTreeRecommender, kNearestRecommender
 from checkpoint2 import AutoRegRecommender, RnnRecommender, LSTMRecommender
 from checkpoint3 import GCNRecommender
 # Cell: Data Exploration Functions
@@ -356,10 +356,11 @@ def run_recommender_analysis():
 
     # Initialize recommenders to compare
     recommenders = [
-        SVMRecommender(seed=42), 
-        RandomRecommender(seed=42),
-        PopularityRecommender(alpha=1.0, seed=42),
-        ContentBasedRecommender(similarity_threshold=0.0, seed=42),
+        #SVMRecommender(seed=42), 
+        #RandomRecommender(seed=42),
+        #PopularityRecommender(alpha=1.0, seed=42),
+        #ContentBasedRecommender(similarity_threshold=0.0, seed=42),
+        kNearestRecommender(seed=42),
         LogRegRecommender(seed=42),
         DecisionTreeRecommender(seed=42),
         GradientBoost(seed=42, optimize = True),  
@@ -368,10 +369,11 @@ def run_recommender_analysis():
         LSTMRecommender(seed=42),
         GCNRecommender(seed=42)
     ]
-    recommender_names = ["SVM", 
-                         "Random", 
-                         "Popularity", 
-                         "ContentBased", 
+    recommender_names = [#"SVM", 
+                         #"Random", 
+                         #"Pop", 
+                         #"Content",
+                         "KNN",
                          "LogReg",
                          "DecTree",
                          "GradBoost",
